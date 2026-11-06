@@ -1,0 +1,22 @@
+name: Feature request
+description: Something the SDK should do and does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you are trying to do
+      description: The problem, from your application's side. What would you build with this?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: An API, if you have one in mind. Sketches are welcome.
+      render: rust
+  - type: textarea
+    id: around
+    attributes:
+      label: What you do today instead
+      description: Workarounds, or the lower-level calls you combine.

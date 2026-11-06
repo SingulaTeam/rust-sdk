@@ -1,0 +1,18 @@
+singula bundles or adapts the following third-party work.
+
+zk/semaphore-16.zkey
+    The Semaphore 4.13.0 proving key for trees of depth 16, from the
+    Semaphore trusted setup, as published by Privacy & Scaling Explorations
+    at https://snark-artifacts.pse.dev/semaphore/4.13.0/semaphore-16.zkey
+    SHA-256 948763c7315a337b7722c0344a28af4be66fbbc618474d6dbe9036e799d1a3b5
+    Semaphore is MIT licensed, © Ethereum Foundation.
+
+zk/semaphore-16.graph
+    The same circuit compiled to a circom-witnesscalc graph, as shipped in
+    semaphore-rs 0.1.0 (witness_graph/semaphore-16.bin).
+    SHA-256 55702b8b08e6bf03a11244ba0f922a27d34a48e4419020b9215316dfe2d41f35
+    semaphore-rs is MIT licensed, © 2025 Ethereum Foundation.
+
+src/zk/baby_jubjub.rs, src/zk/identity.rs
+    The Baby Jubjub curve parameters and the identity derivation follow
+    semaphore-rs (MIT, © 2025 Ethereum Foundation) and EIP-2494.

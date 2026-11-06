@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+// The one open call of the Control Plane's AdminService, as admin.proto in
+// the Control Plane's repository defines it. The package, service and
+// message names must stay identical to the original, since they form the
+// call's path on the wire.
+package singula.admin.v1;
+
+service AdminService {
+  // GetHealth returns the CP health status. Open: it carries no addresses and
+  // is how the network discovers which Control Planes are answering at all.
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1; // "healthy" | "degraded"
+  int64  time   = 2; // Unix timestamp
+}

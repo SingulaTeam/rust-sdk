@@ -1,0 +1,40 @@
+name: Bug report
+description: Something in the SDK does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A security problem does not go here. Report it privately, as SECURITY.md describes.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest code or steps that show it.
+      render: rust
+  - type: textarea
+    id: error
+    attributes:
+      label: Error or output
+      description: The error as printed, with its chain if there is one. Leave out keys, secrets and RPC URLs.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The crate version or commit, and the features enabled.
+      placeholder: 0.1.0, features client + http
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Linux x86_64, Rust 1.93 / Android arm64 / …

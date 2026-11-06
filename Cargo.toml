@@ -1,0 +1,163 @@
+[package]
+name = "singula"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Client SDK for the Singula routing protocol: sessions, reports and anonymous access."
+license = "MIT OR Apache-2.0"
+keywords = ["singula", "privacy", "zero-knowledge", "networking", "protocol"]
+categories = ["cryptography", "network-programming"]
+readme = "README.md"
+repository = "https://github.com/SingulaTeam/rust-sdk"
+homepage = "https://singula.network"
+include = ["src/**/*", "zk/*", "README.md", "CHANGELOG.md", "LICENSE-*", "NOTICE"]
+
+[features]
+default = []
+## Reading the protocol's contracts: the directory, Stars, Control Planes,
+## subscriptions and the subscriber set. Bring your own transport, or enable
+## `http`.
+chain = ["dep:alloy-primitives", "dep:alloy-sol-types"]
+## A JSON-RPC transport over HTTPS for `chain`.
+http = ["chain", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:webpki-root-certs"]
+## Talking to Control Planes: permissions, nodes, sessions, reports and
+## renewals, over gRPC with TLS.
+client = [
+    "chain",
+    "zk",
+    "dep:blind-rsa-signatures",
+    "dep:rsa",
+    "dep:hyper-util",
+    "dep:prost",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tower",
+]
+## Trust the operating system's certificate store for Control Planes instead
+## of the bundled Mozilla roots. Not on Android, whose store native code
+## cannot read.
+native-roots = ["client", "tonic/tls-native-roots"]
+## Anonymous access: Semaphore identities, subscriber groups and proofs. Heavy:
+## it bundles the circuit (about 3.7 MB) and pulls in arkworks.
+zk = [
+    "dep:ark-bn254",
+    "dep:ark-ec",
+    "dep:ark-ed-on-bn254",
+    "dep:ark-ff",
+    "dep:ark-groth16",
+    "dep:ark-relations",
+    "dep:ark-std",
+    "dep:circom-prover",
+    "dep:light-poseidon",
+]
+
+[dependencies]
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+sha3 = "0.10"
+thiserror = "2"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# chain
+alloy-primitives = { version = "1", optional = true, default-features = false, features = ["std"] }
+alloy-sol-types = { version = "1", optional = true, default-features = false, features = ["std"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
+# client
+blind-rsa-signatures = { version = "0.18", optional = true }
+# Not used directly. blind-rsa-signatures takes any rsa 0.10 pre-release, and
+# 0.10.0-rc.21 changed the traits it implements, so a dependent resolving its
+# dependencies afresh would fail to build. Pinned to the last one that works;
+# remove once blind-rsa-signatures builds on the newest rsa.
+rsa = { version = "=0.10.0-rc.19", optional = true, default-features = false }
+hyper-util = { version = "0.1", optional = true, default-features = false, features = ["tokio"] }
+prost = { version = "0.14", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", optional = true, default-features = false }
+tonic = { version = "0.14", optional = true, default-features = false, features = ["transport", "codegen", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = { version = "0.14", optional = true }
+tower = { version = "0.5", optional = true, default-features = false, features = ["util"] }
+
+# zk
+ark-bn254 = { version = "=0.5.0", optional = true }
+ark-ec = { version = "=0.5.0", optional = true }
+ark-ed-on-bn254 = { version = "=0.5.0", optional = true, default-features = false }
+ark-ff = { version = "=0.5.0", optional = true }
+ark-groth16 = { version = "=0.5.0", optional = true, default-features = false, features = ["parallel"] }
+ark-relations = { version = "0.5", optional = true, default-features = false }
+ark-std = { version = "=0.5.0", optional = true, default-features = false, features = ["std"] }
+# Only for its zkey reader and circom's QAP reduction; its witness and proving
+# front-ends are not used.
+circom-prover = { version = "0.1.4", optional = true, default-features = false, features = ["arkworks"] }
+light-poseidon = { version = "0.3", optional = true }
+
+# Android gives a native library no certificate store to read, so the RPC
+# client verifies against Mozilla's roots there, as tonic already does.
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = { version = "1", optional = true }
+
+[dev-dependencies]
+# The BLAKE-512 identities were first derived with; tests check ours agrees.
+blake-hash = "0.4"
+ark-bn254 = "=0.5.0"
+ark-ec = "=0.5.0"
+ark-ff = "=0.5.0"
+ark-groth16 = { version = "=0.5.0", default-features = false }
+criterion = { version = "0.5", default-features = false }
+hex = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+# The SDK's tests stand up a Control Plane.
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router", "server"] }
+
+[[test]]
+name = "zk"
+required-features = ["zk"]
+
+[[test]]
+name = "chain_live"
+required-features = ["http", "zk"]
+
+[[test]]
+name = "client_live"
+required-features = ["client", "http"]
+
+[[example]]
+name = "connect"
+required-features = ["client", "http"]
+
+[[bench]]
+name = "prove"
+harness = false
+required-features = ["zk"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+todo = "deny"

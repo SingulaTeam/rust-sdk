@@ -1,0 +1,901 @@
+syntax = "proto3";
+
+package singula.client.v1;
+
+option go_package = "github.com/singula/star/proto/gen/clientv1";
+
+// ClientService is the interface between client applications and a Control
+// Plane: authentication, session establishment, traffic reporting, and gasless
+// relaying of on-chain transactions.
+//
+// Authentication is by wallet signature. There are no API keys and no
+// registration step.
+//
+// Three operations require no signature, because a caller needs them before a
+// wallet exists:
+//
+//   • GetNetworkInfo (this file)  — contract addresses and prices.
+//   • AdminService.GetHealth      — which Control Planes are reachable.
+//   • AdminService.ListNodes      — Star identity and liveness. Node network
+//                                   addresses are not included; see admin.proto.
+//
+// Every other operation on this stream is authorised individually, against the
+// entitlement that operation requires.
+service ClientService {
+  // Connect establishes a bidirectional stream for real-time communication.
+  // Client sends: authentication, session requests, traffic checkpoints
+  // CP sends: session credentials, status updates, errors
+  rpc Connect(stream ClientMessage) returns (stream ControlPlaneMessage);
+}
+
+// =============================================================================
+// Client -> Control Plane Messages
+// =============================================================================
+
+message ClientMessage {
+  // Formerly `check_nodes`. Reserved at message level rather than inside the
+  // oneof: `reserved` applies to the message's field numbers.
+  reserved 9;
+
+  oneof message {
+    ClientAuth auth = 1;
+    SessionRequest session_request = 2;
+    TrafficCheckpoint traffic_checkpoint = 3;
+    SessionEnd session_end = 4;
+    Pong pong = 5;
+    ActivationRequest activation_request = 6;
+    GetNetworkInfoRequest get_network_info = 7;
+    MintRequest mint_request = 8;
+    ListCountriesRequest list_countries = 10;
+    RegisterCommitmentRequest register_commitment = 11;
+    RenewSessionRequest renew_session = 12;
+    TakePacketRequest take_packet = 13;
+    GetIssuerKeyRequest get_issuer_key = 14;
+    ListNodesRequest list_nodes = 15;
+    FaucetRequest faucet_request = 16;
+    AddSlotsRequest add_slots_request = 17;
+    GovernanceRequest governance_request = 18;
+  }
+}
+
+// ClientAuth authenticates client using wallet signature.
+message ClientAuth {
+  string wallet_address = 1;        // Ethereum wallet address (0x...)
+  bytes signature = 2;              // EIP-191 personal_sign of the sign-in message
+  int64 timestamp = 3;              // Unix timestamp (for replay protection)
+  string nonce = 4;                 // Random nonce (for replay protection)
+  
+  // Client's ephemeral public key for ECDH
+  bytes public_key = 5;             // x25519 public key
+  
+  // Client info
+  ClientInfo client_info = 6;
+}
+
+message ClientInfo {
+  string app_version = 1;           // App version (e.g., "1.0.0")
+  string platform = 2;              // Platform (e.g., "ios", "android", "windows")
+  string preferred_country = 3;     // Preferred country code (ISO 3166-1 alpha-2, e.g., "US")
+}
+
+// SessionRequest requests a new VPN session.
+message SessionRequest {
+  string request_id = 1;            // Unique request ID
+  string preferred_country = 2;     // Preferred country code (ISO 3166-1 alpha-2, empty = any)
+
+  // Fresh ephemeral key for this session (can be different from auth key)
+  bytes session_public_key = 3;     // x25519 public key
+
+  // Cover preset hint forwarded to the chosen node. Values:
+  //   ""        — same as "auto"
+  //   "auto"    — the "default" preset; nothing looks up where the client is
+  //   "RU"|"CN"|"IR"|"default" — request a specific cover preset
+  string region_hint = 4;
+
+  // Formerly `exclude_node_ids`. A list of nodes to avoid is a choice made
+  // by elimination, and node_star_id already names the one wanted; a client
+  // that leaves the choice to the Control Plane leaves all of it.
+  reserved 5;
+  reserved "exclude_node_ids";
+  // Formerly `voucher`, superseded by `access` below.
+  reserved 6;
+  reserved "voucher";
+
+
+  // Ed25519 public key that signs this session's TrafficCheckpoints in place
+  // of the wallet's secp256k1 key. Required when `access` is set, ignored
+  // otherwise. Must be freshly generated per session.
+  bytes checkpoint_public_key = 7;
+
+  // Set when the client reaches this node through another proxy rather than
+  // dialling it directly — the exit leg of a multi-hop chain.
+  //
+  // Such a leg cannot use XTLS Vision, which requires a direct dialer, so the
+  // client presents an empty flow and the node must register the account
+  // without Vision. The node cannot detect the extra hop itself, so the client
+  // declares it here and the Control Plane forwards it in PrepareSession.
+  //
+  // Set on the exit leg only. The entry leg is dialled directly and keeps
+  // Vision.
+  bool chained = 8;
+
+  // Zero-knowledge proof of subscription, used instead of a wallet signature.
+  // When set, the request is valid without a prior ClientAuth on the stream:
+  // the proof is the credential. There is no issuance step — the client builds
+  // the proof itself.
+  AccessProof access = 9;
+
+  // One of the subscription's permissions for this window.
+  //
+  // The proof and the permission answer different questions and neither
+  // replaces the other. The proof says the holder is still a subscriber right
+  // now — a commitment removed when a subscription lapsed cannot produce one.
+  // The permission says how many sessions that subscription may hold, and it
+  // says so across the whole federation, because it was signed blind and is
+  // spent from one shared set.
+  //
+  // Required on the anonymous path; a request without one is refused.
+  Permission permission = 10;
+
+  // Serve this exact node, named by its on-chain Star id.
+  //
+  // Zero leaves the choice to the Control Plane, which is the ordinary case.
+  // Set, it is honoured or refused — never quietly substituted. A client that
+  // named a node did so for a reason the Control Plane cannot see, and giving
+  // it a different one would answer a question it did not ask.
+  //
+  // Candidates come from ListNodes. The Star id is what ties a node to its
+  // owner in StarRegistry, so a client that cares who runs its nodes can check
+  // that itself rather than take anyone's word for it.
+  //
+  // Choosing also keeps the path out of the Control Plane's hands: one that
+  // picked every node could steer its clients onto nodes it works with.
+  uint64 node_star_id = 11;
+}
+
+// Permission is one blind-signed entitlement, for one window.
+//
+// Carries the prepared message rather than the secret behind it: the randomized
+// RFC 9474 variant signs the prepared form, so that is what a verifier checks
+// and what identifies the permission in the spent set.
+//
+// The issuer and window are named because the signing key is registered per
+// (issuer, window) — which is what pins a permission to its window, since the
+// issuer signs blind and cannot police what is inside.
+message Permission {
+  uint64 issuer_star_id    = 1;
+  uint64 window            = 2;
+  bytes  prepared_message  = 3;
+  bytes  signature         = 4;
+  bytes  issuer_public_key = 5; // DER; checked against the on-chain commitment
+}
+
+// AccessProof is a Semaphore membership proof over the on-chain
+// SubscriberRegistry set, together with the nullifier that makes it
+// single-use.
+//
+// Field elements are 32-byte big-endian values, not decimal strings.
+message AccessProof {
+  // Epoch the proof was built for. Advisory only: the Control Plane rebuilds
+  // the scope from its own Star id and its own current epoch, and the proof
+  // must match that.
+  uint64 epoch = 1;
+
+  // Merkle root of the subscriber set the proof was built against. Accepted
+  // while the Control Plane recognises it as current or recently superseded:
+  // any registration moves the root, so a short grace window applies.
+  bytes merkle_root = 2;
+
+  // Derived from (secret, epoch, Control Plane Star id, index), and spendable
+  // once at that Control Plane. The Star id is part of the derivation, so one
+  // subscriber produces a different nullifier at each Control Plane.
+  bytes nullifier = 3;
+
+  // Quota slot within the epoch, in [0, quota). Each slot yields a distinct
+  // nullifier. Bound into the proof and cannot be restated afterwards.
+  uint32 index = 4;
+
+  // Groth16 proof: exactly 8 field elements in the packed order Semaphore
+  // emits — Ethereum calldata order, in which B's Fq2 coefficients are swapped
+  // relative to snarkjs.
+  repeated bytes points = 5;
+}
+
+// VoucherSpend presents one unblinded blind-RSA voucher for redemption.
+//
+// Deprecated: superseded by AccessProof, and retained only for clients that
+// have not yet migrated.
+//
+// The Control Plane verifies the signature against its own epoch key, checks
+// the token against its local nullifier store, and marks it spent atomically
+// with session creation. A voucher is redeemable only at the Control Plane
+// that issued it.
+message VoucherSpend {
+  uint64 issuer_star_id = 1;  // Must be the redeeming Control Plane's Star id
+  uint64 epoch          = 2;  // Epoch the voucher was issued for
+  // The RFC 9474 *prepared message*: randomPrefix(32) ‖ clientToken(32) for
+  // the SHA384-PSS-Randomized variant — 64 bytes total. This is the value
+  // the blind signature verifies over.
+  bytes  token          = 3;
+  bytes  signature      = 4;  // RFC 9474 blind-RSA signature over `token`
+}
+
+// TrafficCheckpoint reports cumulative session traffic, signed by the client.
+// Nodes collect these for reward claims.
+//
+// The signing scheme follows how the session was opened:
+//   • wallet-authenticated — 65-byte secp256k1 ECDSA over keccak256(payload),
+//     using the wallet key;
+//   • anonymous — 64-byte Ed25519 over the same payload, verified against
+//     SessionRequest.checkpoint_public_key.
+//
+// A wallet key must not sign checkpoints for an anonymous session.
+message TrafficCheckpoint {
+  string session_uuid = 1;
+  int64 bytes_uploaded = 2;
+  int64 bytes_downloaded = 3;
+  int64 timestamp = 4;              // Unix timestamp
+  bytes signature = 5;              // secp256k1 or Ed25519, per the scheme above
+  bytes nonce = 6;                  // Current session nonce (rotated per checkpoint)
+}
+
+// SessionEnd notifies CP that client is ending session.
+//
+// A wallet session is ended by its wallet's stream, as before. An anonymous
+// session is ended by its own key: `signature` is the session's Ed25519
+// checkpoint key over
+//
+//   keccak256("singula-end-v1" ‖ session_uuid (36 ASCII bytes)
+//             ‖ final_bytes_uploaded (u64 BE) ‖ final_bytes_downloaded (u64 BE)
+//             ‖ timestamp (i64 BE, Unix seconds))
+//
+// over any stream, signed in or not. The Control Plane answers a signed end
+// with SessionEndResult. Ending the session stops its permission's lease, so
+// the permission is free again across the network within one lease.
+message SessionEnd {
+  string session_uuid = 1;
+  int64 final_bytes_uploaded = 2;
+  int64 final_bytes_downloaded = 3;
+  int64 timestamp = 4;
+  bytes signature = 5;
+}
+
+// Pong responds to Ping from CP.
+message Pong {
+  int64 timestamp = 1;
+}
+
+// =============================================================================
+// Control Plane -> Client Messages
+// =============================================================================
+
+message ControlPlaneMessage {
+  // Formerly `check_nodes_response`.
+  reserved 11;
+
+  oneof message {
+    AuthResult auth_result = 1;
+    SessionCredentials session_credentials = 2;
+    SessionStatus session_status = 3;
+    Error error = 4;
+    Ping ping = 5;
+    SubscriptionStatus subscription_status = 6;
+    ActivationResult activation_result = 7;
+    NetworkInfo network_info = 8;
+    NonceUpdate nonce_update = 9;
+    MintResult mint_result = 10;
+    ListCountriesResponse list_countries_response = 12;
+    RegisterCommitmentResult register_commitment_result = 13;
+    RenewSessionResult renew_session_result = 14;
+    TakePacketResult take_packet_result = 15;
+    GetIssuerKeyResult get_issuer_key_result = 16;
+    ListNodesResult list_nodes_result = 17;
+    SessionEndResult session_end_result = 18;
+    FaucetResult faucet_result = 19;
+    AddSlotsResult add_slots_result = 20;
+    GovernanceResult governance_result = 21;
+  }
+}
+
+// SessionEndResult answers a signed SessionEnd.
+message SessionEndResult {
+  string session_uuid = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// NonceUpdate is pushed to the client after each accepted TrafficCheckpoint.
+// The client MUST use next_nonce in its following checkpoint.
+message NonceUpdate {
+  string session_uuid = 1;
+  bytes  next_nonce   = 2;
+}
+
+// AuthResult is sent after ClientAuth.
+message AuthResult {
+  bool success = 1;
+  string error_message = 2;         // Set if success = false
+  
+  // Subscription info
+  SubscriptionInfo subscription = 3;
+}
+
+message SubscriptionInfo {
+  bool is_active = 1;
+  int64 expires_at = 2;             // Unix timestamp
+  string tier = 3;                  // Subscription tier (e.g., "basic", "pro")
+  int64 bandwidth_limit = 4;        // Monthly bandwidth limit in bytes (0 = unlimited)
+  int64 bandwidth_used = 5;         // Bandwidth used this period
+  int64 token_id = 6;               // Active NFT token ID (0 if not active)
+  int32 unactivated_count = 7;      // Number of owned but not yet activated NFTs
+}
+
+// SessionCredentials contains encrypted VLESS connection info.
+// Only the client can decrypt using ECDH shared secret.
+message SessionCredentials {
+  string request_id = 1;            // Matches SessionRequest.request_id
+  string session_uuid = 2;          // Session identifier
+  
+  // Node identity (for signature verification)
+  string node_id = 3;               // Node's on-chain ID
+  // Removed with the node's Ed25519 master key: the node's signer signature
+  // over the key exchange is what a client checks.
+  reserved 4, 6;
+  reserved "node_master_public_key", "master_key_signature";
+  
+  // ECDH key exchange
+  bytes session_public_key = 5;     // Node's ephemeral x25519 public key
+  
+  // Encrypted credentials
+  bytes encrypted_credentials = 7;  // AES-GCM encrypted VlessCredentials
+  bytes nonce = 8;                  // AES-GCM nonce
+  
+  // Session limits
+  int64 expires_at = 9;             // Session expiry (Unix timestamp)
+
+  // Traffic checkpoint challenge nonce (client must include in first TrafficCheckpoint)
+  bytes challenge_nonce = 10;
+
+  // How this session's node reaches the internet.
+  //
+  // Reported from what the node observed rather than from its configuration,
+  // so a failed WARP registration is reported as direct. Self-reported.
+  EgressMode egress_mode = 11;
+
+  // Which Control Plane this session's checkpoints must go to, as a Star id.
+  //
+  // Zero, and the answer is "the one you are talking to" — the ordinary case.
+  // It is set when the node serving you belongs to another operator: that
+  // Control Plane generated your challenge nonce and holds the node's stream,
+  // so it is the only party that can turn your reports into payment for the
+  // node. Reporting to anyone else means the node works for nothing.
+  //
+  // Resolve the address yourself from CPEndpointRegistry rather than asking
+  // for it — a Star id names a party the chain can vouch for, an address does
+  // not.
+  uint64 report_to_star_id = 12;
+
+  // The node's on-chain signer key over this session's key exchange; see
+  // SessionReady.signer_signature in node.proto for the exact digest. Recover
+  // the address and compare it with StarRegistry.getSigner for the node: it
+  // is the one check here that a relaying Control Plane cannot satisfy for a
+  // node it does not run.
+  bytes node_signer_signature = 13;
+}
+
+// SessionStatus provides real-time session updates.
+message SessionStatus {
+  string session_uuid = 1;
+  SessionState state = 2;
+  string message = 3;               // Human-readable status message
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_PREPARING = 1;      // Node is preparing credentials
+  SESSION_STATE_READY = 2;          // Credentials sent, client can connect
+  SESSION_STATE_ACTIVE = 3;         // VPN connection active
+  SESSION_STATE_TERMINATED = 4;     // Session ended
+  SESSION_STATE_ERROR = 5;          // Error occurred
+}
+
+// Error reports an error condition.
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  string request_id = 3;            // Related request ID (if applicable)
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_AUTH_FAILED = 1;
+  ERROR_CODE_SUBSCRIPTION_EXPIRED = 2;
+  ERROR_CODE_SUBSCRIPTION_NOT_FOUND = 3;
+  ERROR_CODE_NO_NODES_AVAILABLE = 4;
+  ERROR_CODE_NODE_ERROR = 5;
+  ERROR_CODE_SESSION_NOT_FOUND = 6;
+  ERROR_CODE_RATE_LIMITED = 7;
+  ERROR_CODE_INTERNAL = 8;
+  // The permission presented is held already: by a session open now, or by
+  // one the client refused after admission, until its lease runs out. Take
+  // another of the subscription's permissions; this one will not be admitted
+  // again soon.
+  ERROR_CODE_PERMISSION_SPENT = 9;
+  // The session proof's quota slot was used already this epoch at this
+  // Control Plane — by another of the subscription's devices, which count
+  // their slots apart. Prove the next slot.
+  ERROR_CODE_ACCESS_CLAIM_USED = 10;
+}
+
+// SubscriptionStatus provides subscription updates.
+message SubscriptionStatus {
+  SubscriptionInfo subscription = 1;
+  string message = 2;               // e.g., "Subscription renewed", "Expires soon"
+}
+
+// Ping checks connection liveness.
+message Ping {
+  int64 timestamp = 1;
+}
+
+// =============================================================================
+// Subscription Activation
+// =============================================================================
+
+// ActivationRequest asks the CP to call activateWithSignature on behalf of the
+// client (gasless activation). The client pre-signs:
+//   1. inner EIP-712 ActivationRequest intent (signature)
+//   2. outer EIP-191 GasStation.relayClient meta-tx (gas_sig + gas_deadline)
+// CP is a pure forwarder — does not sign anything.
+message ActivationRequest {
+  uint64 token_id     = 1;  // NFT token ID to activate
+  string wallet       = 2;  // Client's Ethereum wallet address
+  int64  deadline     = 3;  // Unix timestamp — inner-signature expiry
+  bytes  signature    = 4;  // EIP-712 signature produced by the client's wallet
+  int64  gas_deadline = 5;  // Unix timestamp — relayClient meta-tx expiry
+  bytes  gas_sig      = 6;  // 65-byte EIP-191 sig over relayClient digest
+
+  // The holder's Semaphore identity commitments, 32 bytes big-endian each,
+  // at most one per slot of the Orbit, joined to the anonymity set in the
+  // same transaction as the activation. They are part of what the holder
+  // signs, so none can be swapped in transit. Empty to activate without
+  // joining; the holder can register separately later.
+  repeated bytes commitments = 8;
+
+  // Formerly a single `commitment`, from before an Orbit had slots.
+  reserved 7;
+  reserved "commitment";
+}
+
+// ActivationResult is sent back after the activation transaction is mined.
+message ActivationResult {
+  bool   success       = 1;
+  string error_message = 2;  // Set if success = false
+  string tx_hash       = 3;  // On-chain tx hash (set if success = true)
+  uint64 token_id      = 4;  // Activated token ID
+  int64  expires_at    = 5;  // Subscription expiry (Unix timestamp)
+}
+
+// EgressMode mirrors the enum of the same name in node.proto. Duplicated so a
+// client need not depend on the node protocol.
+enum EgressMode {
+  EGRESS_MODE_UNSPECIFIED = 0;
+  EGRESS_MODE_DIRECT = 1;
+  EGRESS_MODE_WARP = 2;
+  EGRESS_MODE_CUSTOM = 3;
+}
+
+// =============================================================================
+// Network Info
+// =============================================================================
+
+// GetNetworkInfoRequest asks for current contract addresses and prices.
+//
+// Requires no authentication: the values are public on chain, and a client
+// needs them before it has a wallet. They are also what a client needs to
+// construct and sign activation transactions offline.
+message GetNetworkInfoRequest {}
+
+// NetworkInfo carries chain parameters and current prices.
+//
+// Convenience, not a trust anchor: every value here comes from the Control
+// Plane the client is talking to, and the client checks Control Planes
+// against the chain, not the other way round.
+//
+// Anything a decision rests on comes from SingulaProtocol instead: one address
+// pinned in the client's own build, reached over an RPC the client chose, with
+// every other address read from it. These fields exist so a wallet-tier client
+// can show prices and build a mint transaction without a second round trip,
+// and for nothing else.
+message NetworkInfo {
+  int64  chain_id              = 1;  // EVM chain ID (421614 = Arbitrum Sepolia)
+  string rpc_url               = 2;  // A public RPC. A hint; see the note above.
+  string subscription_nft_addr = 3;  // SubscriptionNFT contract address
+  string echo_token_address    = 4;  // EchoToken ERC-20 address
+  string usdc_token_address    = 5;  // USDC ERC-20 address
+  string price_usdc_wei        = 6;  // Current USDC price in wei (string to avoid overflow)
+  string price_echo_wei        = 7;  // Current Echo price in wei (string to avoid overflow)
+  uint64 mint_nonce            = 8;  // Caller's current on-chain mint nonce (from mintNonces[wallet])
+}
+
+// =============================================================================
+// Gasless Mint
+// =============================================================================
+
+// MintRequest asks the CP to call mintWithPermit on behalf of the client.
+// Client pre-signs:
+//   1. EIP-712 MintRequest intent (mint_sig)
+//   2. ERC-20 permit for token approval (permit_v/r/s)
+//   3. outer EIP-191 GasStation.relayClient meta-tx (gas_sig + gas_deadline)
+// CP is a pure forwarder — does not sign anything; GasStation pays gas
+// and accounts it against the client's per-epoch EOA budget.
+message MintRequest {
+  bool   pay_with_echo   = 1;  // true = ECHO (20% off), false = USDC
+  string wallet          = 2;  // Client's Ethereum wallet address
+  string max_cost        = 3;  // Max token amount agreed to (wei, string)
+  int64  mint_deadline   = 4;  // Unix timestamp — EIP-712 mint intent expiry
+  bytes  mint_sig        = 5;  // 65-byte EIP-712 MintRequest signature
+  int64  permit_deadline = 6;  // Unix timestamp — ERC-20 permit expiry
+  uint32 permit_v        = 7;  // ERC-20 permit signature v
+  bytes  permit_r        = 8;  // ERC-20 permit signature r (32 bytes)
+  bytes  permit_s        = 9;  // ERC-20 permit signature s (32 bytes)
+  int64  gas_deadline    = 10; // Unix timestamp — relayClient meta-tx expiry
+  bytes  gas_sig         = 11; // 65-byte EIP-191 sig over relayClient digest
+
+  // Concurrent sessions the Orbit pays for, 1 to 5. It costs that many times
+  // the price, and is part of what mint_sig signs.
+  uint32 slots           = 12;
+}
+
+// RegisterCommitmentRequest asks the Control Plane to relay a subscriber's
+// registration into the on-chain SubscriberRegistry, so joining the anonymity
+// set costs the subscriber no gas.
+//
+// The registry verifies `register_sig` itself: a Control Plane can decline to
+// relay, but cannot register a commitment the wallet did not sign for.
+//
+// The wallet-to-commitment pair is public on chain once the transaction lands.
+// A membership proof never reveals which commitment it used.
+message RegisterCommitmentRequest {
+  string wallet        = 1;  // Ethereum wallet holding the subscription
+  uint64 token_id      = 2;  // Subscription NFT being registered
+  int64  deadline      = 4;  // EIP-712 Register intent expiry
+  bytes  register_sig  = 5;  // 65-byte EIP-712 Register signature
+
+  // 32-byte Semaphore identity commitments, one per slot at most counting
+  // those already registered for this Orbit.
+  repeated bytes commitments = 8;
+
+  // Formerly a single `commitment`, from before an Orbit had slots; and
+  // `gas_deadline` and `gas_sig` — the relay now goes through GasStation.relay(),
+  // which the Control Plane signs with its own key.
+  reserved 3, 6, 7;
+  reserved "commitment", "gas_deadline", "gas_sig";
+}
+
+// RegisterCommitmentResult is sent back once the transaction is mined.
+message RegisterCommitmentResult {
+  bool   success       = 1;
+  string error_message = 2;
+  string tx_hash       = 3;
+}
+
+// MintResult is sent back after the mint transaction is mined.
+message MintResult {
+  bool   success       = 1;
+  string error_message = 2;  // Set if success = false
+  string tx_hash       = 3;  // On-chain tx hash (set if success = true)
+  uint64 token_id      = 4;  // Minted token ID
+}
+
+// FaucetRequest asks for test USDC, on a test network only.
+//
+// The wallet signs a GasStation.relayClient meta-transaction calling the test
+// token's `mint(wallet, amount)`, so the gas comes out of the wallet's own
+// per-epoch budget and nobody can ask on another wallet's behalf. A Control
+// Plane on a production network answers with an error: there, USDC is real
+// and has no public mint.
+//
+// `amount` is capped: a wallet that already holds the cap gets nothing more.
+message FaucetRequest {
+  string wallet       = 1;  // Wallet to mint to; must be the authenticated one
+  string amount       = 2;  // Token amount (smallest units, decimal string)
+  int64  gas_deadline = 3;  // Unix timestamp — relayClient meta-tx expiry
+  bytes  gas_sig      = 4;  // 65-byte EIP-191 sig over the relayClient digest
+}
+
+message FaucetResult {
+  bool   success       = 1;
+  string error_message = 2;  // Set if success = false
+  string tx_hash       = 3;  // On-chain tx hash (set if success = true)
+}
+
+// GovernanceRequest takes part in the network's governance without ETH:
+// opening a proposal, voting on one, or replying in its discussion, as a
+// subscriber or as a Star's owner.
+//
+// `call` is the ABI-encoded call to one of ProtocolGovernor's participant
+// functions (proposeAsStar, proposeAsSubscriber, voteAsStar,
+// voteAsSubscriber, argueAsStar, argueAsSubscriber). The wallet signs it
+// twice: EIP-712 typed data `Act(wallet, data, nonce, deadline)` in the
+// governor's domain, which the governor checks before running the call as the
+// wallet; and a GasStation.relayClient meta-transaction over
+// `act(wallet, call, act_deadline, act_sig)`, which GasStation pays for.
+//
+// The stream need not be signed in: the two signatures already bind the
+// action to the wallet. The Control Plane checks the call names a participant
+// function, simulates it, and refuses what would revert. Whether the wallet may do it — weight,
+// ownership of a Star, the proposal's state — is the governor's to decide.
+message GovernanceRequest {
+  string wallet       = 1;  // The signer; no sign-in is needed
+  bytes  call         = 2;  // ABI-encoded participant call
+  int64  act_deadline = 3;  // Unix timestamp — the Act signature's expiry
+  bytes  act_sig      = 4;  // 65-byte EIP-712 sig over Act
+  int64  gas_deadline = 5;  // Unix timestamp — relayClient meta-tx expiry
+  bytes  gas_sig      = 6;  // 65-byte EIP-191 sig over the relayClient digest
+}
+
+message GovernanceResult {
+  bool   success       = 1;
+  string error_message = 2;  // Set if success = false
+  string tx_hash       = 3;  // On-chain tx hash (set if success = true)
+}
+
+// AddSlotsRequest adds slots to an Orbit the wallet holds, paid for the part
+// of its term left, and joins the anonymity set with the new slots'
+// identities. Relayed like a mint: the client pre-signs the EIP-712 AddSlots
+// intent, an ERC-20 permit, and the GasStation.relayClient meta-tx.
+message AddSlotsRequest {
+  string wallet          = 1;  // Client's Ethereum wallet address
+  uint64 token_id        = 2;  // The Orbit to add to
+  uint32 extra           = 3;  // Slots to add; the Orbit ends up with at most 5
+  // 32-byte Semaphore identity commitments for the new slots, at most one
+  // each; empty for an Orbit not activated yet, which names them at activation.
+  repeated bytes commitments = 4;
+  string max_cost        = 5;  // Max USDC agreed to (wei, string)
+  int64  deadline        = 6;  // Unix timestamp — EIP-712 intent expiry
+  bytes  sig             = 7;  // 65-byte EIP-712 AddSlots signature
+  int64  permit_deadline = 8;  // Unix timestamp — ERC-20 permit expiry
+  uint32 permit_v        = 9;
+  bytes  permit_r        = 10;
+  bytes  permit_s        = 11;
+  int64  gas_deadline    = 12; // Unix timestamp — relayClient meta-tx expiry
+  bytes  gas_sig         = 13; // 65-byte EIP-191 sig over relayClient digest
+}
+
+message AddSlotsResult {
+  bool   success       = 1;
+  string error_message = 2;  // Set if success = false
+  string tx_hash       = 3;  // On-chain tx hash (set if success = true)
+}
+
+// =============================================================================
+// Country listing
+// =============================================================================
+
+// ListCountriesRequest asks for the countries that currently have at least one
+// available node.
+message ListCountriesRequest {
+  string request_id = 1;
+}
+
+// CountryEntry describes one country with a positive node count.
+message CountryEntry {
+  string country    = 1;  // ISO 3166-1 alpha-2
+  int32  node_count = 2;  // Currently available (heartbeat-fresh, has capacity)
+}
+
+// ListCountriesResponse returns the aggregated country list. Order is not
+// guaranteed — the client should sort for display.
+message ListCountriesResponse {
+  string request_id = 1;
+  repeated CountryEntry countries = 2;
+}
+
+// =============================================================================
+// Session renewal
+// =============================================================================
+
+// RenewSessionRequest asks to extend a session that is about to expire.
+//
+// A session is issued for a fixed stretch and then ends. Renewal is how a
+// client that is still entitled carries on without the tunnel dropping — and,
+// more to the point, how one that has stopped being entitled is noticed. The
+// subscription is checked again here, so a lapsed one stops working within a
+// renewal period rather than whenever its last session happened to run out.
+//
+// Send it before expiry, not after: once the session is gone the node has
+// already removed the credentials and there is nothing left to extend.
+message RenewSessionRequest {
+  string request_id   = 1;
+  string session_uuid = 2;
+
+  // Formerly `access`, a fresh membership proof for an anonymous session
+  // opened without a permission. Every anonymous session now holds one: inside
+  // its window it renews on the signature below alone, and across the boundary
+  // it presents `permission`. Wallet-tier sessions need neither — the Control
+  // Plane re-reads the subscription on chain.
+  reserved 3;
+  reserved "access";
+
+  // A permission from the window being renewed INTO.
+  //
+  // This is how an anonymous session carries on without the tunnel dropping,
+  // and how a lapsed subscription stops carrying on. A permission for the next
+  // window needs a fresh membership proof, so a subscriber whose commitment was
+  // removed cannot obtain one — and their session ends at the boundary without
+  // anything having to hunt it down.
+  //
+  // A permission rather than a proof because the permission is what counts
+  // sessions: renewing on a bare proof would extend a session without spending
+  // anything, and a permission would stop meaning one session.
+  Permission permission = 4;
+
+  // Proof that the sender holds the session, so renewal works over any stream.
+  //
+  // An Ed25519 signature by the session's checkpoint key — the key named in
+  // SessionRequest.checkpoint_public_key, the same one that signs
+  // TrafficCheckpoint — over
+  //
+  //   keccak256("singula-renew-v1" ‖ session_uuid ‖ 0x00 ‖ request_id ‖ timestamp)
+  //
+  // with session_uuid and request_id as UTF-8 bytes, a single zero byte
+  // between them, and timestamp as 8 bytes big-endian. The prefix keeps a checkpoint signature from being accepted
+  // as a renewal and the other way round.
+  //
+  // Without it, the renewal is accepted only on the stream that opened the
+  // session.
+  bytes signature = 5;
+
+  // Unix seconds at signing. Refused when more than five minutes away from
+  // the Control Plane's clock.
+  int64 timestamp = 6;
+}
+
+// RenewSessionResult answers RenewSessionRequest.
+message RenewSessionResult {
+  string request_id   = 1;
+  string session_uuid = 2;
+  bool   success      = 3;
+  int64  expires_at   = 4; // new expiry, Unix seconds, when success is true
+  string error_message = 5;
+}
+
+// =============================================================================
+// Permissions
+// =============================================================================
+
+// ListNodesRequest asks which nodes this Control Plane can serve right now.
+//
+// Open to any stream. Node identity is on chain already, and what is added
+// here — how busy a node is and how far it is from this Control Plane — says
+// nothing about any client.
+message ListNodesRequest {
+  string request_id = 1;
+}
+
+// ClientNode is one candidate, described by what a client needs to choose.
+//
+// Deliberately without an address, a port or a REALITY key. Those reach a
+// client with its session credentials and exist in no public place; listing
+// them here would put a map of the network one call away.
+message ClientNode {
+  // On-chain Star id. Everything about who runs this node — owner, role — is
+  // read from StarRegistry under this id, by the client, from the chain.
+  uint64 star_id = 1;
+
+  // Country as the node reports it about itself.
+  string country = 2;
+
+  // Round trip from this Control Plane to the node, in milliseconds. Zero
+  // means it has not been measured yet.
+  //
+  // Not the client's latency to the node, and it cannot be: a Control Plane
+  // does not know where a client is and never asks. Added to the client's own
+  // round trip to this Control Plane, it is the closest estimate of the whole
+  // path available from what either side legitimately knows.
+  uint32 latency_ms = 3;
+
+  // Current load, 0.0 to 1.0, and whether the node is accepting sessions at
+  // all. A client that picks a full node is refused, so both are worth having
+  // before choosing rather than after.
+  float load      = 4;
+  bool  available = 5;
+}
+
+// ListNodesResult carries the candidates, in no particular order.
+message ListNodesResult {
+  string request_id = 1;
+  repeated ClientNode nodes = 2;
+}
+
+// TakePacketRequest asks for one of the subscription's permissions for this
+// window, by its index.
+//
+// Each index is issued once per subscription per window, across the whole
+// federation rather than per Control Plane: the proof is scoped to the window
+// and the index, with no CP in it, so the nullifier it spends means the same
+// thing everywhere.
+//
+// The message is blinded, so the issuer signs a value it never sees and cannot
+// link the permission to the request it came from. Validity is pinned by which
+// key signs: keys are registered per window in VoucherKeyRegistry, and a
+// verifier accepts a permission only under the key for the window it is in.
+//
+// Retrying with the same blinded message returns the same signature and costs
+// nothing: a client that lost the reply keeps its permission. A different
+// message for an index already issued is refused with `index_taken`.
+message TakePacketRequest {
+  string request_id = 1;
+
+  // Membership proof, built against the permission scope for this window and
+  // `index` rather than a CP scope.
+  AccessProof access = 2;
+
+  // Exactly one blinded permission message.
+  repeated bytes blinded = 3;
+
+  // Which of the subscription's permissions this is, below the published
+  // count. Each index is taken once per window, network-wide; a
+  // subscription's devices each take their own.
+  uint32 index = 4;
+}
+
+// GetIssuerKeyRequest asks which key this Control Plane is blind-signing with.
+//
+// Needed before a permission can be asked for at all: blinding is done under the
+// issuer's public key, so a client that does not have it cannot produce the
+// request. The key is not on chain — only a commitment to it is — so there is
+// nowhere else to read it from.
+//
+// Open to an unauthenticated stream, like the permission request it precedes. The
+// answer is the same public value for every caller and reveals nothing about
+// who asked.
+message GetIssuerKeyRequest {
+  string request_id = 1;
+}
+
+// GetIssuerKeyResult carries the key and what a client needs to check it.
+//
+// The key is checked, not trusted: VoucherKeyRegistry holds
+// keccak256(DER ‖ packet_size) for each (issuer, window), committed a window
+// ahead, and a client that reads that commitment knows it was given the key
+// every other client was given. Both values needed for the check are here.
+message GetIssuerKeyResult {
+  string request_id    = 1;
+  bool   success       = 2;
+  string error_message = 3;
+
+  uint64 issuer_star_id    = 4;
+  uint64 window            = 5;
+  bytes  issuer_public_key = 6; // DER, SubjectPublicKeyInfo
+
+  // How many permissions a subscription has per window under this key, and
+  // therefore how many sessions it may hold at once. Part of the on-chain
+  // commitment, so a client checking the key checks this with it.
+  uint32 packet_size = 7;
+}
+
+// TakePacketResult carries the blind signature.
+//
+// The client unblinds it against the state it kept. What it holds afterwards
+// is a pair — the prepared message and the signature — because the randomized
+// variant signs the prepared form, not the secret behind it. A client that kept
+// only its secret would hold a signature it cannot present.
+message TakePacketResult {
+  string request_id    = 1;
+  bool   success       = 2;
+  string error_message = 3;
+
+  repeated bytes blind_signatures = 4;
+
+  // The issuer, so the client knows whose key a verifier must look up, and the
+  // key itself so it need not fetch it from chain to present the permission.
+  uint64 issuer_star_id = 5;
+  bytes  issuer_public_key = 6; // DER, SubjectPublicKeyInfo
+  uint64 window         = 7;
+
+  // The index was taken already, by another of the subscription's devices or
+  // an earlier request: try another.
+  bool index_taken = 8;
+}

@@ -1,0 +1,12 @@
+[package]
+name = "singula-codegen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Regenerates the SDK's gRPC client from proto/. Not part of the crate."
+
+[dependencies]
+protox = "0.10"
+tonic-prost-build = "0.14"
+
+[workspace]

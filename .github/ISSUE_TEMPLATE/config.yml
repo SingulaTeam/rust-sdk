@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/SingulaTeam/rust-sdk/security/advisories/new
+    about: Privately, so it can be fixed before it is known. Please do not open a public issue.
+  - name: Protocol documentation
+    url: https://singula.network
+    about: How the protocol works, beyond this SDK.
