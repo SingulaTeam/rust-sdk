@@ -111,29 +111,30 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
-    async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self
+    fn get(&self, key: &Key) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let value = self
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key.as_str())
-            .cloned())
+            .cloned();
+        std::future::ready(Ok(value))
     }
 
-    async fn put(&self, key: &Key, value: &[u8]) -> Result<(), StoreError> {
+    fn put(&self, key: &Key, value: &[u8]) -> impl Future<Output = Result<(), StoreError>> + Send {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.as_str().to_owned(), value.to_vec());
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn delete(&self, key: &Key) -> Result<(), StoreError> {
+    fn delete(&self, key: &Key) -> impl Future<Output = Result<(), StoreError>> + Send {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key.as_str());
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 

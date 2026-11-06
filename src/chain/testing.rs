@@ -55,15 +55,27 @@ impl MockRpc {
 }
 
 impl Rpc for MockRpc {
-    async fn chain_id(&self) -> Result<u64, RpcError> {
-        Ok(self.chain_id)
+    fn chain_id(&self) -> impl Future<Output = Result<u64, RpcError>> + Send {
+        std::future::ready(Ok(self.chain_id))
     }
 
-    async fn block_number(&self) -> Result<u64, RpcError> {
-        Ok(self.block)
+    fn block_number(&self) -> impl Future<Output = Result<u64, RpcError>> + Send {
+        std::future::ready(Ok(self.block))
     }
 
-    async fn call(&self, to: Address, data: &[u8], block: Block) -> Result<Vec<u8>, RpcError> {
+    fn call(
+        &self,
+        to: Address,
+        data: &[u8],
+        block: Block,
+    ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + Send {
+        std::future::ready(self.respond(to, data, block))
+    }
+}
+
+impl MockRpc {
+    /// What `call` answers: the canned reply, after noting the block asked at.
+    fn respond(&self, to: Address, data: &[u8], block: Block) -> Result<Vec<u8>, RpcError> {
         self.blocks_seen
             .lock()
             .map_err(|_| RpcError::Malformed("poisoned"))?

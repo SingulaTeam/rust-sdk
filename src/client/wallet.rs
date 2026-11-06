@@ -398,15 +398,20 @@ impl Wallet for LocalWallet {
         self.address
     }
 
-    async fn sign_message(
+    fn sign_message(
         &self,
         message: PersonalMessage<'_>,
-    ) -> Result<WalletSignature, WalletError> {
-        Ok(self.sign_hash(&eth::personal_message_hash(message.bytes())))
+    ) -> impl Future<Output = Result<WalletSignature, WalletError>> + Send {
+        std::future::ready(Ok(
+            self.sign_hash(&eth::personal_message_hash(message.bytes()))
+        ))
     }
 
-    async fn sign_typed_data(&self, data: &TypedData) -> Result<WalletSignature, WalletError> {
-        Ok(self.sign_hash(&data.signing_hash()))
+    fn sign_typed_data(
+        &self,
+        data: &TypedData,
+    ) -> impl Future<Output = Result<WalletSignature, WalletError>> + Send {
+        std::future::ready(Ok(self.sign_hash(&data.signing_hash())))
     }
 }
 
