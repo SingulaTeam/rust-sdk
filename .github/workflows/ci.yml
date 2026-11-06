@@ -99,3 +99,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --all-features
+
+  # The one check a branch ruleset needs to require: it passes only when every
+  # job above did, so adding or renaming a job never means editing the rule.
+  # `always()` makes it run, and fail, even when a job it waits on failed or
+  # was cancelled; without it a skipped check would count as passing.
+  ci:
+    name: CI passed
+    if: always()
+    needs: [fmt, clippy, test, docs, msrv, codegen, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "Results: ${{ toJSON(needs.*.result) }}"
+          exit 1
+      - run: echo "All checks passed."
