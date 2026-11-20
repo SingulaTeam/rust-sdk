@@ -1160,3 +1160,50 @@ async fn each_of_a_clients_sessions_takes_its_own_slot() {
     again.close().await;
     second.close().await;
 }
+
+#[tokio::test]
+async fn a_slot_is_free_again_when_its_session_ends_or_its_opening_is_dropped() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula(&wallet).await;
+    let options = || {
+        super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick())
+    };
+
+    // An opening cancelled midway gives its slot back.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(1),
+        singula.connect(&wallet, options(), Traffic::default),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the opening was still running");
+    let mut conn = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("the one slot is free again");
+
+    // The network closes the session: the slot is free by the time the
+    // application hears of it, so reconnecting at once works.
+    cp_state
+        .state()
+        .journal
+        .statuses
+        .insert(conn.id().to_string(), (2, "idle".into()));
+    let ended = async {
+        while let Some(event) = conn.next_event().await {
+            if let super::Event::Ended(reason) = event {
+                return reason;
+            }
+        }
+        panic!("the connection stopped without ending");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), ended)
+        .await
+        .expect("in time");
+    let again = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("reconnects at once on the slot given back");
+    again.close().await;
+}

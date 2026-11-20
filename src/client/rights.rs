@@ -7,7 +7,7 @@
 //! for the day, so reconnecting costs no new proof.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rand_core::{OsRng, RngCore as _};
@@ -36,8 +36,32 @@ pub(super) struct JournalState {
     /// Slots another device was found on, and the day it was.
     busy: HashMap<u8, Epoch>,
     /// Slots carrying one of this client's sessions, or about to: a slot
-    /// holds one session at a time.
-    held: HashSet<u8>,
+    /// holds one session at a time. A plain mutex, so a [`SlotLease`] can
+    /// give its slot back when dropped.
+    held: Arc<Mutex<HashSet<u8>>>,
+}
+
+/// A slot taken for one session. Dropping it gives the slot back — when
+/// the session ends, fails to open, or the call opening it is cancelled.
+#[derive(Debug)]
+pub(super) struct SlotLease {
+    slot: u8,
+    held: Arc<Mutex<HashSet<u8>>>,
+}
+
+impl SlotLease {
+    pub(super) fn slot(&self) -> u8 {
+        self.slot
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.slot);
+    }
 }
 
 /// A slot's right for one day, with its key.
@@ -133,8 +157,8 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
     /// Takes a slot for a new session on `window`: one that carries none of
     /// this client's sessions and is not in `tried`, preferring those no other
     /// device was found on today, at random among equals so devices starting
-    /// at once rarely pick the same. The slot stays taken until
-    /// [`release_slot`](Self::release_slot).
+    /// at once rarely pick the same. The slot stays taken while the returned
+    /// [`SlotLease`] lives.
     ///
     /// # Errors
     ///
@@ -146,11 +170,12 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         identities: &Identities,
         window: Epoch,
         tried: &HashSet<u8>,
-    ) -> Result<(u8, Arc<Identity>), ClientError> {
-        let mut journal = self.inner.journal.lock().await;
+    ) -> Result<(SlotLease, Arc<Identity>), ClientError> {
+        let journal = self.inner.journal.lock().await;
+        let mut held = journal.held.lock().unwrap_or_else(PoisonError::into_inner);
         let mut free: Vec<_> = identities
             .iter()
-            .filter(|(slot, _)| !journal.held.contains(slot))
+            .filter(|(slot, _)| !held.contains(slot))
             .cloned()
             .collect();
         if free.is_empty() {
@@ -164,13 +189,12 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         }
         free.sort_by_key(|(slot, _)| journal.busy.get(slot) == Some(&window));
         let (slot, identity) = free.into_iter().next().ok_or(ClientError::NotRegistered)?;
-        journal.held.insert(slot);
-        Ok((slot, identity))
-    }
-
-    /// Gives back a slot taken by [`take_slot`](Self::take_slot).
-    pub(super) async fn release_slot(&self, slot: u8) {
-        self.inner.journal.lock().await.held.remove(&slot);
+        held.insert(slot);
+        let lease = SlotLease {
+            slot,
+            held: Arc::clone(&journal.held),
+        };
+        Ok((lease, identity))
     }
 
     /// The window a ping made at `now` belongs to: the window `now` falls

@@ -21,7 +21,7 @@ use super::governance::{GovernanceAction, Participant};
 use super::pinger::{self, OnRight};
 use super::records::Records;
 use super::relay::{Activated, MAX_SLOTS, Minted};
-use super::rights::JournalState;
+use super::rights::{JournalState, SlotLease};
 use super::session::{NotOpened, SessionRequest};
 use super::store::Store;
 use super::time::{SystemTime, TimeSource};
@@ -534,35 +534,34 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
             .ok_or(ClientError::Mismatch("the protocol has not started"))?;
         let mut tried = HashSet::new();
         loop {
-            let (slot, identity) = self.take_slot(&identities, window, &tried).await?;
-            tried.insert(slot);
+            // Given back when dropped: by an error here, or a cancelled call.
+            let (lease, identity) = self.take_slot(&identities, window, &tried).await?;
+            tried.insert(lease.slot());
             match self
-                .open_on_slot(&cp, options, slot, &identity, window)
+                .open_on_slot(&cp, options, lease, &identity, window)
                 .await
             {
                 Ok(opened) => {
                     return Ok(pinger::start(self.clone(), opened, meter, options.timing));
                 }
                 // Its Orbit ends during the day: another slot may not.
-                Err(ClientError::NotRegistered) => self.release_slot(slot).await,
-                Err(e) => {
-                    self.release_slot(slot).await;
-                    return Err(e);
-                }
+                Err(ClientError::NotRegistered) => {}
+                Err(e) => return Err(e),
             }
         }
     }
 
-    /// Opens a session at `cp` on slot `slot`'s right for `window`.
+    /// Opens a session at `cp` on the right of the slot `lease` holds, for
+    /// `window`. The session keeps the lease while it lives.
     async fn open_on_slot(
         &self,
         cp: &ControlPlaneClient,
         options: &ConnectOptions,
-        slot: u8,
+        lease: SlotLease,
         identity: &Arc<Identity>,
         window: Epoch,
     ) -> Result<OnRight, ClientError> {
-        let day = self.day_right(identity, slot, window).await?;
+        let day = self.day_right(identity, lease.slot(), window).await?;
         let params = self.inner.chain.journal_params();
         let request = SessionRequest::on_right(day.right.clone(), Arc::clone(&day.key), params);
         let session = cp
@@ -575,7 +574,7 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
             tunnel,
             admitting: cp.clone(),
             identity: Arc::clone(identity),
-            slot,
+            lease,
             window,
             day,
         })
