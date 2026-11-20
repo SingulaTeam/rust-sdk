@@ -51,7 +51,8 @@ pub struct Contracts {
     pub star_registry: Option<Address>,
     /// The anonymity set: subscribers' identity commitments, in order.
     pub subscriber_registry: Option<Address>,
-    /// Commitments to the keys Control Planes issue permissions under.
+    /// Commitments to the keys Control Planes issued per-window permissions
+    /// under, before the shared journal replaced them.
     pub permission_key_registry: Option<Address>,
     /// Control Planes' published endpoints.
     pub control_plane_registry: Option<Address>,

@@ -190,8 +190,8 @@ impl Renewal<'_> {
 /// The end of a session, signed by that session's key.
 ///
 /// How an anonymous client ends its session early: nothing else ties it to
-/// the session across calls. Ending it frees the session's permission across
-/// the network within one lease.
+/// the session across calls. Ending it closes the session on its node at
+/// once, rather than once its pings stop.
 ///
 /// # Wire format
 ///

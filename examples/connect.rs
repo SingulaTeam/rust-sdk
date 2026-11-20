@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tunnel = conn.tunnel();
     eprintln!("node {} at {}:{}", conn.node(), tunnel.address, tunnel.port);
 
-    // Reports and renewals happen on their own; these are what they did.
+    // Pings happen on their own; these say how they went, and why it ended.
     while let Some(event) = conn.next_event().await {
         eprintln!("{event:?}");
     }

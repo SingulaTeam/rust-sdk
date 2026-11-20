@@ -8,6 +8,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The shared journal (`journal`, in the core): a subscriber's slot takes a
+  daily `Right` — a Semaphore proof against the day's subscriber tree — and
+  delegates the day to a `RightKey`, derived from the slot's secret and the
+  day so every device of a subscription derives the same one. Sessions are
+  kept by `Ping`s of their seconds so far, signed with that key; Control
+  Planes answer with `Attestation`s that `Versions::check_ack` checks against
+  the Control Plane registry's history (`RegistryVersion`). `CloseReason` and
+  `SessionStatus` say why the network closed a session. Every wire format is
+  checked against the Control Planes' fixture of real proofs and signatures.
+- `Claim::Right`, `Identity::right_key` and `AccessProof::to_right`.
+- `chain::RegistryHistory`, the Control Plane set's history from
+  `StarRegistry`'s events up to the finalized block, and
+  `chain::SubscriberLog` with `SubscriberLog::window_tree`, a day's subscriber
+  trees as the Control Planes build them: read from the chain, never taken
+  from a Control Plane. Both start at the deployment blocks the directory
+  publishes. `Chain::journal_params`.
+- `Rpc::header` and `Rpc::logs`, and `Block::Finalized`. Logs are read one
+  event at a time, in spans the node accepts.
+- `SessionRequest::on_right`, `ControlPlaneClient::ping` (`Ack`,
+  `Ack::committed`) and `ControlPlaneClient::session_status`.
+- `Event::Pinged`, `Event::PingFailed`, `EndReason::ClosedByNetwork` and
+  `Timing::ping_every`.
+- `SessionId::to_bytes`.
+
 - `Singula::governance` and `ControlPlaneClient::governance`: proposals,
   votes and replies in `ProtocolGovernor`, as a subscriber or as a Star's
   owner (`Participant`, `GovernanceAction`, `Vote`), without ETH. The wallet
@@ -45,13 +69,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `Singula::connect` with `Access::Anonymous` opens the session on the day's
+  right of one of the wallet's slots and keeps it by pings every five
+  minutes: a ping counts once a strict majority of Control Planes recorded
+  it, as checked against the chain, and goes to another Control Plane when
+  one cannot show that. Past midnight the session carries on under the next
+  day's right. A session the network closes ends with the reason; one closed
+  because another device holds the slot leaves that slot for the next
+  connection. Needs Control Planes that run the shared journal.
+- `Rpc` has two more required methods, and `Block` is `#[non_exhaustive]`.
+- `EndReason` is no longer `Copy`: `ClosedByNetwork` carries a reason.
+- `ControlPlaneClient::renew` takes no permission: only a wallet's session
+  is renewed.
+- `ClientError::NotRegistered` also covers a slot whose Orbit ends during
+  the day; `ClientError::NotCommitted` is a ping no majority recorded.
 - `k256` 0.13 → 0.14, which moves its big-integer arithmetic to
   `crypto-bigint` 0.7.6 and later (RUSTSEC-2026-0387). `LocalWallet::random`
   now draws its key from the operating system's generator directly.
-- `blind-rsa-signatures` 0.17 → 0.18. `rsa` is pinned to 0.10.0-rc.19:
-  `blind-rsa-signatures` accepts any `rsa` 0.10 pre-release, and rc.21 no
-  longer builds with it, so a project resolving its dependencies afresh
-  would otherwise fail to compile this crate.
 
 - `mint` in USDC signs `mint_cost` plus the gas fee's ceiling, not the
   nominal price: if the discount a wallet was quoted is gone when the
@@ -70,21 +104,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   identity per slot, all derived from the one wallet signature
   (`Identity::for_slot`; slot 0 is the identity as before), so activation and
   registration take a list of commitments. `Singula::identities` lists the
-  wallet's identities in the set, and `Singula::connect` takes each session's
-  permission with whichever has one free. Needs `SubscriptionNFT` v3 and
+  wallet's identities in the set, and `Singula::connect` opens each session
+  on one of their rights. Needs `SubscriptionNFT` v3 and
   `SubscriberRegistry` v2, and Control Planes that speak the new `MintRequest`,
   `ActivationRequest` and `RegisterCommitmentRequest`.
-- Permissions are taken one at a time, each under an index of its own
-  (`Claim::Permission { window, index }`, `ControlPlaneClient::take_permission`),
-  in place of one packet per window. A subscription's devices can now each
-  take their own, together no more than the issuer's count; `Singula::connect`
-  picks a free index and moves past those taken elsewhere
-  (`ClientError::PermissionTaken`). Needs Control Planes that take the index.
-- `Singula::connect` proves the next quota slot when a Control Plane refuses
-  one as used (`ERROR_CODE_ACCESS_CLAIM_USED`): each device counts its slots
-  apart, and another may have used the first ones.
 - BLAKE-512 for identities is computed in the crate: `blake-hash` panics on
   ARM. Identities are unchanged.
+
+### Removed
+
+- Per-window permissions, which the daily right replaces: `Permission`,
+  `IssuerKey`, `ControlPlaneClient::issuer_key` and `take_permission`,
+  `SessionRequest::anonymous`, `Claim::Session` and `Claim::Permission`,
+  `chain::PermissionKeyCommitment` and `Chain::permission_key_commitment`,
+  and `ClientError::NoPermissionFree`, `PermissionTaken` and
+  `PermissionFreeAt`. With them go the `blind-rsa-signatures` and `rsa`
+  dependencies.
 
 ### Fixed
 

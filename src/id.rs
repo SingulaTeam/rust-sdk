@@ -18,8 +18,8 @@ impl fmt::Display for StarId {
     }
 }
 
-/// A protocol epoch: one day of served time, and also the window a packet of
-/// permissions belongs to.
+/// A protocol epoch: one day of served time, and also the window a day's
+/// right belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u64);
 
