@@ -24,6 +24,7 @@ alloy_sol_types::sol! {
 
         function snapshot() external view returns (Snapshot memory);
         function contractFor(bytes32 name) external view returns (address);
+        function param(bytes32 name) external view returns (uint256);
     }
 
     /// The participant functions of `ProtocolGovernor`, which a wallet signs
@@ -47,6 +48,12 @@ alloy_sol_types::sol! {
 
         function getStar(uint256 starId) external view returns (StarInfo memory);
         function getStarIdBySigner(address signer) external view returns (uint256);
+
+        // The three events that change who is a Control Plane, and with
+        // which key. `Role` is an enum, an uint8 in the ABI.
+        event StarRegistered(uint256 indexed starId, address indexed owner, address signer);
+        event RoleForced(uint256 indexed starId, uint8 oldRole, uint8 newRole, bool withSlashing);
+        event SignerUpdated(uint256 indexed starId, address indexed oldSigner, address indexed newSigner);
     }
 
     interface ICPEndpointRegistry {
@@ -94,6 +101,8 @@ alloy_sol_types::sol! {
         function commitmentsOf(uint256 tokenId) external view returns (uint256[] memory registered, uint256[] memory indices);
         function commitmentsSlice(uint256 start, uint256 count) external view returns (uint256[] memory);
         function circuitVersion() external view returns (string memory);
+
+        event Registered(uint256 indexed index, uint256 indexed tokenId, uint256 commitment);
     }
 
     interface ISubscriptionNFT {

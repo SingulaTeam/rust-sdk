@@ -27,6 +27,8 @@ mod deployment;
 pub mod front;
 #[cfg(feature = "http")]
 mod http;
+mod journal;
+mod logs;
 mod payments;
 mod permissions;
 mod rpc;
@@ -46,9 +48,12 @@ use alloy_sol_types::SolCall;
 pub use deployment::{Clock, Contracts, Deployment, Network};
 #[cfg(feature = "http")]
 pub use http::HttpRpc;
+pub use journal::{RegistryHistory, SubscriberLeaf, SubscriberLog};
+#[cfg(feature = "zk")]
+pub use journal::{WindowTree, WindowTreeError};
 pub use payments::{GasOp, Payment, fee_ceiling};
 pub use permissions::PermissionKeyCommitment;
-pub use rpc::{Block, Rpc, RpcError};
+pub use rpc::{Block, Header, Log, LogFilter, Rpc, RpcError};
 pub use stars::{ControlPlane, Role, Star};
 pub use subscriptions::{Subscription, TokenId, TxHash};
 

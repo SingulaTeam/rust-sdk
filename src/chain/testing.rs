@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use alloy_sol_types::SolCall;
 
-use super::rpc::{Block, Rpc, RpcError};
-use crate::id::Address;
+use super::rpc::{Block, Header, Log, LogFilter, Rpc, RpcError};
+use crate::id::{Address, UnixTime};
 
 /// Answers calls from a table, and records which blocks were asked for.
 pub(crate) struct MockRpc {
@@ -14,6 +14,14 @@ pub(crate) struct MockRpc {
     pub(crate) block: u64,
     answers: HashMap<(Address, Vec<u8>), Vec<u8>>,
     pub(crate) blocks_seen: Mutex<Vec<Block>>,
+    /// The finalized block; `block` (the tip) unless set.
+    pub(crate) finalized: Option<u64>,
+    /// Every log on the chain, in log order.
+    pub(crate) logs: Vec<(Address, Log)>,
+    /// The widest span `logs` answers; wider is refused as nodes do.
+    pub(crate) max_span: u64,
+    /// How many log queries were made.
+    pub(crate) log_queries: Mutex<u32>,
 }
 
 impl MockRpc {
@@ -23,6 +31,10 @@ impl MockRpc {
             block: 1_000,
             answers: HashMap::new(),
             blocks_seen: Mutex::new(Vec::new()),
+            finalized: None,
+            logs: Vec::new(),
+            max_span: u64::MAX,
+            log_queries: Mutex::new(0),
         }
     }
 
@@ -70,6 +82,72 @@ impl Rpc for MockRpc {
         block: Block,
     ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + Send {
         std::future::ready(self.respond(to, data, block))
+    }
+
+    fn header(&self, block: Block) -> impl Future<Output = Result<Header, RpcError>> + Send {
+        let number = match block {
+            Block::Number(n) => n,
+            Block::Finalized => self.finalized.unwrap_or(self.block),
+            _ => self.block,
+        };
+        std::future::ready(Ok(Self::header_of(number)))
+    }
+
+    fn logs(&self, filter: &LogFilter) -> impl Future<Output = Result<Vec<Log>, RpcError>> + Send {
+        if let Ok(mut n) = self.log_queries.lock() {
+            *n += 1;
+        }
+        // As Arbitrum's public node: a hundredth of the span for a query
+        // with more than one value per topic.
+        let max_span = if filter.events.len() > 1 {
+            self.max_span / 100
+        } else {
+            self.max_span
+        };
+        if filter.to.saturating_sub(filter.from) >= max_span {
+            return std::future::ready(Err(RpcError::Node {
+                code: -32_005,
+                message: "query exceeds max block range".to_owned(),
+            }));
+        }
+        let found = self
+            .logs
+            .iter()
+            .filter(|(at, l)| {
+                *at == filter.address
+                    && (filter.from..=filter.to).contains(&l.block)
+                    && l.topics.first().is_some_and(|t| filter.events.contains(t))
+            })
+            .map(|(_, l)| l.clone())
+            .collect();
+        std::future::ready(Ok(found))
+    }
+}
+
+impl MockRpc {
+    /// Block `n`: hashed as its number, one second per block from 1000.
+    pub(crate) fn header_of(n: u64) -> Header {
+        let mut hash = [0; 32];
+        hash[24..].copy_from_slice(&n.to_be_bytes());
+        Header::new(
+            n,
+            hash,
+            UnixTime(1_000 + i64::try_from(n).unwrap_or(i64::MAX)),
+        )
+    }
+
+    /// Emits `topics`/`data` from `address` in block `block`.
+    pub(crate) fn emit(
+        &mut self,
+        address: Address,
+        block: u64,
+        topics: Vec<[u8; 32]>,
+        data: Vec<u8>,
+    ) {
+        let index = self.logs.iter().filter(|(_, l)| l.block == block).count() as u64;
+        let hash = Self::header_of(block).hash;
+        self.logs
+            .push((address, Log::new(block, hash, index, topics, data)));
     }
 }
 
