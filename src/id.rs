@@ -90,6 +90,29 @@ impl SessionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The UUID's 16 bytes, as the shared journal signs a session.
+    ///
+    /// ```
+    /// # use singula::SessionId;
+    /// let id: SessionId = "8f14e45f-ceea-467f-a8d5-1a2b3c4d5e6f".parse()?;
+    /// assert_eq!(id.to_bytes()[..2], [0x8f, 0x14]);
+    /// # Ok::<(), singula::SessionIdError>(())
+    /// ```
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0; 16];
+        let digits = self.0.bytes().filter(|b| *b != b'-');
+        for (i, d) in digits.enumerate() {
+            // Checked lowercase hex when the id was made.
+            let nibble = match d {
+                b'0'..=b'9' => d - b'0',
+                _ => d - b'a' + 10,
+            };
+            out[i / 2] |= if i % 2 == 0 { nibble << 4 } else { nibble };
+        }
+        out
+    }
 }
 
 impl FromStr for SessionId {

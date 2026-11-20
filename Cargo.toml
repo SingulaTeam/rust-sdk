@@ -59,6 +59,7 @@ zk = [
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 k256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 hkdf = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"

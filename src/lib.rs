@@ -42,6 +42,7 @@ mod eth;
 #[cfg(any(feature = "chain", feature = "zk"))]
 mod hex;
 mod id;
+pub mod journal;
 mod session;
 mod sign_in;
 mod signing;
