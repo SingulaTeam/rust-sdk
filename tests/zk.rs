@@ -88,6 +88,82 @@ impl Setup {
     }
 }
 
+/// Right `a` of the journal's fixture: window 10, its key, and the Control
+/// Plane's `SemaphoreHash` of the right's scope and message.
+const RIGHT_KEY: (&str, &str) = (
+    "e417ce2cc31ef29ce38c7a1e75631e8d8c8209a4f508b8e81c74d41c14ccc431",
+    "0d2c42f380d728d51d87e4b26261bc4b3d4a6f5459c0b8b6d1077e19ef75c73a",
+);
+const RIGHT_SCOPE: &str =
+    "447793967648333678719443863230786612109752310857686584872885604805821712085";
+const RIGHT_MESSAGE: &str =
+    "52204751582231114037403491615054938693844254530108889856078236979011909626";
+
+fn right_claim(key: (&str, &str)) -> Claim {
+    let bytes = |s: &str| -> [u8; 32] {
+        hex::decode(s)
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    };
+    Claim::Right {
+        window: Epoch(10),
+        key: (bytes(key.0), bytes(key.1)),
+    }
+}
+
+#[test]
+fn a_right_proof_passes_the_control_planes_check() {
+    let s = Setup::new();
+    let proof = s.prove(right_claim(RIGHT_KEY));
+    assert!(s.verifies(&proof, RIGHT_MESSAGE, RIGHT_SCOPE));
+    let right = proof.to_right(0).expect("a right claim makes a right");
+    assert_eq!(right.nullifier.0, proof.nullifier.to_be_bytes());
+    assert!(
+        s.prove(SESSION).to_right(0).is_none(),
+        "only a right claim does"
+    );
+
+    // One slot, one nullifier a day, whatever key it delegates to.
+    let other_key = s.prove(right_claim((RIGHT_KEY.1, RIGHT_KEY.0)));
+    assert_eq!(other_key.nullifier, proof.nullifier);
+    assert!(
+        !s.verifies(&other_key, RIGHT_MESSAGE, RIGHT_SCOPE),
+        "the message binds the key"
+    );
+}
+
+#[test]
+fn the_fixtures_right_verifies_as_we_hash_it() {
+    // Made by the JavaScript client library, checked by the Control Plane's
+    // Go journal; here against the scope and message this crate computes.
+    let f: Value = serde_json::from_str(include_str!("data/journal-fixture.json"))
+        .expect("the fixture parses");
+    let r = &f["rights"]["a"];
+    let field = |v: &Value| {
+        let bytes = hex::decode(v.as_str().expect("hex").trim_start_matches("0x")).expect("hex");
+        Fr::from_be_bytes_mod_order(&bytes)
+    };
+    let mut points = [[0u8; 32]; 8];
+    for (p, v) in points
+        .iter_mut()
+        .zip(r["points"].as_array().expect("points"))
+    {
+        let raw = hex::decode(v.as_str().expect("hex").trim_start_matches("0x")).expect("hex");
+        p[32 - raw.len()..].copy_from_slice(&raw);
+    }
+    let signals = [
+        field(&f["sweepRoot"]),
+        field(&r["nullifier"]),
+        Fr::from_str(RIGHT_MESSAGE).unwrap_or_else(|()| panic!("a field element")),
+        Fr::from_str(RIGHT_SCOPE).unwrap_or_else(|()| panic!("a field element")),
+    ];
+    let proof = unpack(&points).expect("points on their curves");
+    assert!(
+        Groth16::<Bn254>::verify_proof(&control_plane_key(), &proof, &signals).unwrap_or(false)
+    );
+}
+
 #[test]
 fn a_session_proof_passes_the_control_planes_check() {
     let s = Setup::new();
@@ -198,4 +274,27 @@ fn control_plane_key() -> PreparedVerifyingKey<Bn254> {
             .map(g1)
             .collect(),
     })
+}
+
+#[test]
+fn an_identitys_right_key_is_derived_from_its_secret() {
+    use singula::journal::{JournalParams, RightKey};
+    let identity = Identity::from_secret(SECRET).expect("a valid secret");
+    let secret: [u8; 32] = hex::decode(&SECRET[2..])
+        .expect("valid hex")
+        .try_into()
+        .expect("32 bytes");
+    let params = JournalParams::new(421_614);
+    let from_identity = identity.right_key(params, Epoch(170)).expect("derives");
+    let from_bytes = RightKey::derive(&secret, params, Epoch(170)).expect("derives");
+    assert_eq!(from_identity.public_key(), from_bytes.public_key());
+    let next_slot = identity
+        .for_slot(1)
+        .right_key(params, Epoch(170))
+        .expect("derives");
+    assert_ne!(
+        next_slot.public_key(),
+        from_identity.public_key(),
+        "each slot its own key"
+    );
 }

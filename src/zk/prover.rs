@@ -15,6 +15,7 @@ use super::field::FieldElement;
 use super::group::{Group, MAX_DEPTH};
 use super::identity::Identity;
 use super::witness::{Graph, GraphError};
+use crate::journal::{Nullifier, Right};
 
 /// Semaphore's proving key for trees up to 2^16 members: the artifact PSE
 /// publishes for Semaphore 4.13.0 from its trusted setup, byte for byte. The
@@ -100,6 +101,24 @@ pub struct AccessProof {
     /// order Ethereum's pairing precompile takes them: `A.x, A.y`, then `B`
     /// with each Fq2 pair high coefficient first, then `C.x, C.y`.
     pub points: [[u8; 32]; 8],
+}
+
+impl AccessProof {
+    /// The day's [`Right`] this proof makes, against the window's tree state
+    /// `state_index`; `None` unless it was made for a [`Claim::Right`].
+    #[must_use]
+    pub fn to_right(&self, state_index: u32) -> Option<Right> {
+        let Claim::Right { window, key } = self.claim else {
+            return None;
+        };
+        Some(Right::new(
+            window,
+            state_index,
+            Nullifier(self.nullifier.to_be_bytes()),
+            key,
+            self.points,
+        ))
+    }
 }
 
 impl Prover {

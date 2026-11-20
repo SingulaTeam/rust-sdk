@@ -11,6 +11,8 @@ use zeroize::{Zeroize as _, Zeroizing};
 use super::baby_jubjub::BabyJubjub;
 use super::blake512::blake512;
 use super::field::{FieldElement, Poseidon2};
+use crate::id::Epoch;
+use crate::journal::{JournalParams, RightKey, RightKeyError};
 use ark_ec::twisted_edwards::TECurveConfig as _;
 
 /// A Semaphore identity, derived from a wallet signature so the same wallet
@@ -167,6 +169,31 @@ impl Identity {
     #[must_use]
     pub fn secret(&self) -> &str {
         &self.secret
+    }
+
+    /// This identity's [`RightKey`] for `window`: the key its slot's day is
+    /// delegated to. Every device holding the identity derives the same one.
+    ///
+    /// The derivation's input is the 32 bytes the secret's hex spells.
+    ///
+    /// # Errors
+    ///
+    /// As [`RightKey::derive`]: in practice, never.
+    pub fn right_key(
+        &self,
+        params: JournalParams,
+        window: Epoch,
+    ) -> Result<RightKey, RightKeyError> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        // The secret is "0x" and 64 lowercase hex digits, checked on the way in.
+        for (i, pair) in self.secret.as_bytes()[2..].chunks_exact(2).enumerate() {
+            let nibble = |d: u8| match d {
+                b'0'..=b'9' => d - b'0',
+                _ => d - b'a' + 10,
+            };
+            bytes[i] = nibble(pair[0]) << 4 | nibble(pair[1]);
+        }
+        RightKey::derive(&bytes, params, window)
     }
 
     /// The scalar the circuit takes as its `secret` input.

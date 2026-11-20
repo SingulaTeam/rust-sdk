@@ -78,6 +78,25 @@ pub struct Right {
 }
 
 impl Right {
+    /// A right from its parts: a proof made for its window and key, against
+    /// tree state `state_index`.
+    #[must_use]
+    pub const fn new(
+        window: Epoch,
+        state_index: u32,
+        nullifier: Nullifier,
+        key: ([u8; 32], [u8; 32]),
+        points: [[u8; 32]; 8],
+    ) -> Self {
+        Self {
+            window,
+            state_index,
+            nullifier,
+            key,
+            points,
+        }
+    }
+
     /// The canonical encoding a Control Plane takes.
     ///
     /// ```text
