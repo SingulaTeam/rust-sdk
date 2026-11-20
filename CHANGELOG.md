@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Singula::connect` and `ControlPlaneClient::open_session` return `Send`
+  futures again, so a session can be opened from a spawned task. Opening on a
+  right held a non-`Sync` reference across an await.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

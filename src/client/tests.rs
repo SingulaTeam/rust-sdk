@@ -1105,3 +1105,18 @@ mod journal {
         );
     }
 }
+
+/// Every long-running call can be spawned on a multi-threaded runtime, as an
+/// application keeping a session in the background does.
+#[tokio::test]
+async fn connections_and_calls_can_be_spawned() {
+    fn send<T: Send>(_: &T) {}
+    let wallet = LocalWallet::random();
+    let (_, singula) = singula(&wallet).await;
+    send(&singula.connect(&wallet, super::ConnectOptions::new(), Traffic::default));
+    send(&singula.choose_control_plane());
+    send(&singula.identities(&wallet));
+    let (_, cp, chain) = setup(wallet.address()).await;
+    let auth = WalletAuth::sign(&wallet, CP).await.expect("signs");
+    send(&cp.open_session(&chain, SessionRequest::wallet(auth)));
+}
