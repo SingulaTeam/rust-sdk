@@ -38,6 +38,9 @@ use crate::eth;
 use crate::id::{Address, RequestId, SessionId, StarId, UnixTime};
 use crate::sign_in::SignInMessage;
 
+mod journal;
+pub(super) use journal::{Acks, MockJournal};
+
 /// The Control Plane's Star id.
 pub(super) const CP: StarId = StarId(8);
 /// The node's.
@@ -127,6 +130,17 @@ pub(super) struct State {
     pub(super) holds_after_end: bool,
     /// Sessions opened, for distinct ids.
     sessions_opened: u64,
+    /// The shared journal it keeps with its federation.
+    pub(super) journal: MockJournal,
+}
+
+/// What one stream has said so far.
+#[derive(Default)]
+struct Stream {
+    /// The wallet it signed in as.
+    wallet: Option<Address>,
+    /// The challenge it was issued for a session on a right.
+    challenge: Option<[u8; 32]>,
 }
 
 /// A clock a test moves by hand.
@@ -195,6 +209,7 @@ impl MockCp {
             clock: None,
             refuse_renewals: false,
             unsigned_credentials: false,
+            journal: MockJournal::new(),
         })))
     }
 
@@ -236,11 +251,10 @@ impl ClientService for MockCp {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let cp = self.clone();
         tokio::spawn(async move {
-            // The wallet this stream signed in as.
-            let mut wallet = None;
+            let mut stream = Stream::default();
             while let Ok(Some(msg)) = inbound.message().await {
                 let Some(msg) = msg.message else { continue };
-                let replies = cp.handle(&mut wallet, msg);
+                let replies = cp.handle(&mut stream, msg);
                 for message in replies {
                     if tx
                         .send(Ok(ControlPlaneMessage {
@@ -281,7 +295,8 @@ fn refuse(request_id: &str, why: &str) -> Vec<Out> {
 }
 
 impl MockCp {
-    fn handle(&self, wallet: &mut Option<Address>, msg: In) -> Vec<Out> {
+    fn handle(&self, stream: &mut Stream, msg: In) -> Vec<Out> {
+        let wallet = &mut stream.wallet;
         match msg {
             In::Auth(a) => Self::auth(wallet, &a),
             In::ListNodes(r) => vec![Out::ListNodesResult(wire::ListNodesResult {
@@ -321,7 +336,44 @@ impl MockCp {
                 })]
             }
             In::TakePacket(r) => self.take_packet(r),
-            In::SessionRequest(r) => self.open(*wallet, r),
+            In::SessionRequest(r) => {
+                let challenge = stream.challenge.take();
+                self.open(stream.wallet, challenge, r)
+            }
+            In::LedgerChallenge(r) => {
+                let mut challenge = [0u8; 32];
+                OsRng.fill_bytes(&mut challenge);
+                stream.challenge = Some(challenge);
+                let s = self.state();
+                vec![Out::LedgerChallenge(wire::LedgerChallenge {
+                    request_id: r.request_id,
+                    challenge: challenge.to_vec(),
+                    expires_at: s.now().0 + 60,
+                    cp_star_id: s.journal.challenge_names.0,
+                })]
+            }
+            In::LedgerPing(r) => {
+                let mut s = self.state();
+                let now = s.now();
+                vec![Out::LedgerAck(s.journal.ping(&r, now))]
+            }
+            In::LedgerSessionStatus(r) => {
+                let s = self.state();
+                let (state, reason) = s
+                    .journal
+                    .statuses
+                    .get(&r.session_uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                vec![Out::LedgerSessionStatus(wire::LedgerSessionStatus {
+                    request_id: r.request_id,
+                    session_uuid: r.session_uuid,
+                    state,
+                    reason,
+                    total: 0,
+                    last: 0,
+                })]
+            }
             In::TrafficCheckpoint(c) => self.checkpoint(&c),
             In::RenewSession(r) => self.renew(r),
             In::SessionEnd(e) if !e.signature.is_empty() => self.end_signed(&e),
@@ -415,9 +467,20 @@ impl MockCp {
         })]
     }
 
-    fn open(&self, wallet: Option<Address>, r: wire::SessionRequest) -> Vec<Out> {
-        let anonymous = r.access.is_some();
-        if anonymous && r.permission.is_none() {
+    fn open(
+        &self,
+        wallet: Option<Address>,
+        challenge: Option<[u8; 32]>,
+        r: wire::SessionRequest,
+    ) -> Vec<Out> {
+        if let Some(Err(why)) = r.ledger.as_ref().map(|l| {
+            let mut s = self.state();
+            s.journal.admit(challenge, l, &r.session_public_key)
+        }) {
+            return refuse(&r.request_id, why);
+        }
+        let anonymous = r.access.is_some() || r.ledger.is_some();
+        if r.access.is_some() && r.permission.is_none() {
             return refuse(&r.request_id, "a permission is required");
         }
         if !anonymous && wallet.is_none() {

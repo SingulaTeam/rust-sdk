@@ -55,6 +55,9 @@ message ClientMessage {
     FaucetRequest faucet_request = 16;
     AddSlotsRequest add_slots_request = 17;
     GovernanceRequest governance_request = 18;
+    LedgerChallengeRequest ledger_challenge = 19;
+    LedgerPing ledger_ping = 20;
+    LedgerSessionStatusRequest ledger_session_status = 21;
   }
 }
 
@@ -151,6 +154,26 @@ message SessionRequest {
   // Choosing also keeps the path out of the Control Plane's hands: one that
   // picked every node could steer its clients onto nodes it works with.
   uint64 node_star_id = 11;
+
+  // A session opened on a right of the shared journal (internal/ledger)
+  // instead of `access` and `permission`. The right is the day's slot; the
+  // signature proves the sender holds its key. Set, the stream needs no other
+  // credential, and checkpoints are LedgerPing rather than TrafficCheckpoint.
+  LedgerAccess ledger = 12;
+}
+
+// LedgerAccess opens a session on a right.
+message LedgerAccess {
+  // The right, in the journal's canonical encoding: a Semaphore proof that a
+  // paid slot delegated the day to a P-256 key.
+  bytes right = 1;
+  // The challenge from LedgerChallenge on this stream; single use, short-lived.
+  bytes challenge = 2;
+  // 64 bytes r ‖ s: P-256 by the right's key over ledger.OpenDigest —
+  // SHA-256("singula-open-v1" ‖ chainId ‖ domain ‖ challenge ‖ cp_star_id ‖
+  // session_public_key). Binds the session to this CP and to the key the
+  // credentials are sealed to.
+  bytes signature = 3;
 }
 
 // Permission is one blind-signed entitlement, for one window.
@@ -294,6 +317,9 @@ message ControlPlaneMessage {
     FaucetResult faucet_result = 19;
     AddSlotsResult add_slots_result = 20;
     GovernanceResult governance_result = 21;
+    LedgerChallenge ledger_challenge = 22;
+    LedgerAck ledger_ack = 23;
+    LedgerSessionStatus ledger_session_status = 24;
   }
 }
 
@@ -898,4 +924,97 @@ message TakePacketResult {
   // The index was taken already, by another of the subscription's devices or
   // an earlier request: try another.
   bool index_taken = 8;
+}
+
+// =============================================================================
+// The shared journal
+// =============================================================================
+
+// LedgerChallengeRequest asks for a challenge to open a session with.
+message LedgerChallengeRequest {
+  string request_id = 1;
+}
+
+message LedgerChallenge {
+  string request_id = 1;
+  bytes challenge = 2;   // 32 random bytes, for one SessionRequest on this stream
+  int64 expires_at = 3;  // Unix seconds
+  uint64 cp_star_id = 4; // what the open signature names
+}
+
+// LedgerPing is a session's checkpoint: the client-signed ping and, beside it,
+// the traffic the CP uses in real time (idle rules, closing a session that
+// carries traffic without growing). Traffic is not signed and does not reach
+// the journal.
+//
+// `right` carries a new day's right into a running session: the first ping of
+// a window goes with that window's right, and the tunnel stays up across
+// midnight. The ping's signature by the right's key is what proves the client
+// holds it, so no challenge is needed. Totals start from zero under the new
+// right; the session keeps its id.
+message LedgerPing {
+  string request_id = 1;
+  bytes ping = 2;        // canonical encoding, without attestations
+  uint64 bytes_up = 3;   // since the session began
+  uint64 bytes_down = 4;
+  bytes right = 5;       // canonical encoding of the ping's right, when it is new to the session
+}
+
+// LedgerAck answers a LedgerPing. `quorum` is whether a strict majority of one
+// CP registry version attested the ping; their attestations are here for the
+// client to check against that version's CPs, read from the chain. A client
+// moves to another CP when pings stop reaching a quorum — and only a checked
+// quorum resets that timer.
+message LedgerAck {
+  string request_id = 1;
+  bytes ping_hash = 2;
+  repeated LedgerAttestation attestations = 3;
+  bool quorum = 4;
+  string error = 5;
+  // registry_version names the CP registry version whose strict majority
+  // the attestations are, when quorum is set: the client checks them against
+  // that version's CPs, read from the chain itself.
+  bytes registry_version = 6;
+}
+
+// LedgerAttestation: CP `cp` first held the ping at `received_at`, as a CP of
+// registry version `registry_version`. 65 bytes r ‖ s ‖ v by the CP's signer
+// over keccak256("singula-attest-v2" ‖ chainId ‖ domain ‖ ping_hash ‖
+// registry_version ‖ received_at).
+message LedgerAttestation {
+  uint64 cp = 1;
+  int64 received_at = 2;
+  bytes sig = 3;
+  bytes registry_version = 4; // 32 bytes
+}
+
+// LedgerSessionStatusRequest: a client whose tunnel dropped asks why.
+message LedgerSessionStatusRequest {
+  string request_id = 1;
+  string session_uuid = 2;
+}
+
+// LedgerSessionStatus: whether this Control Plane still holds the session
+// open, and if it closed, why — so the client can reopen at once, move to
+// another CP, or pick another node.
+//
+// reason, when closed: "no_pings", "right_ended", "pings_not_growing",
+// "idle", "overlap" (closed by a CP); "node_not_growing" (the node's
+// watchdog), "shared_credentials" (the node saw its credentials used from
+// several places), "expired" or "terminated" (closed by the node). Empty with
+// state UNKNOWN when this CP never held it.
+message LedgerSessionStatus {
+  string request_id = 1;
+  string session_uuid = 2;
+  LedgerSessionState state = 3;
+  string reason = 4;
+  // The latest committed ping's total and time, when there is one.
+  uint64 total = 5;
+  int64 last = 6;
+}
+
+enum LedgerSessionState {
+  LEDGER_SESSION_STATE_UNKNOWN = 0;
+  LEDGER_SESSION_STATE_OPEN = 1;
+  LEDGER_SESSION_STATE_CLOSED = 2;
 }

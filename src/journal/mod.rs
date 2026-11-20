@@ -33,6 +33,7 @@ mod key;
 mod ping;
 mod registry;
 mod right;
+mod status;
 
 pub use attestation::Attestation;
 pub use key::{RightKey, RightKeyError, open_digest};
@@ -41,6 +42,7 @@ pub use registry::{
     AckError, Committed, RegistryVersion, RegistryVersionId, VERSION_GRACE, Versions, VersionsError,
 };
 pub use right::{Nullifier, Right, right_message, right_scope};
+pub use status::{CloseReason, SessionStatus};
 
 use sha3::{Digest as _, Keccak256};
 

@@ -1,7 +1,9 @@
 //! Opening, reporting on and renewing sessions.
 
 use super::auth::WalletAuth;
-use super::call::{Conversation, Step, exchange, request_id};
+use std::sync::Arc;
+
+use super::call::{Conversation, Step, Turn, dialogue, exchange, request_id};
 use super::permission::Permission;
 use super::proto::client::client_message::Message as Outbound;
 use super::proto::client::control_plane_message::Message as Inbound;
@@ -11,7 +13,8 @@ use super::proto::client::{
 use super::{ClientError, ControlPlaneClient, Country};
 use crate::chain::{Chain, Role, Rpc};
 use crate::digest::{Checkpoint, Ending, Renewal};
-use crate::id::{Address, Epoch, SessionId, StarId, UnixTime};
+use crate::id::{Address, Epoch, RequestId, SessionId, StarId, UnixTime};
+use crate::journal::{JournalParams, Right, RightKey};
 use crate::session::{Credentials, SealedCredentials, SessionKeypair};
 use crate::signing::CheckpointKey;
 use crate::zk::{AccessProof, Claim};
@@ -55,6 +58,13 @@ enum Admission {
     },
     /// By the wallet's sign-in: the Control Plane knows which wallet.
     Wallet(WalletAuth),
+    /// By the day's right of one of the subscriber's slots, and a signature
+    /// by its key over the Control Plane's challenge.
+    Right {
+        right: Box<Right>,
+        key: Arc<RightKey>,
+        params: JournalParams,
+    },
 }
 
 /// What an [`Admission`] puts on the wire.
@@ -79,6 +89,20 @@ impl SessionRequest {
     /// the wallet's subscription on chain, and knows whose session it is.
     pub fn wallet(auth: WalletAuth) -> Self {
         Self::with(Admission::Wallet(auth))
+    }
+
+    /// A session on the day's `right` of one of the subscriber's slots,
+    /// whose `key` signs the Control Plane's challenge. The Control Plane
+    /// learns that some paid slot connected today, and nothing else.
+    ///
+    /// The session is then kept by pings
+    /// ([`ControlPlaneClient::ping`]), not reports and renewals.
+    pub fn on_right(right: Right, key: Arc<RightKey>, params: JournalParams) -> Self {
+        Self::with(Admission::Right {
+            right: Box::new(right),
+            key,
+            params,
+        })
     }
 
     fn with(admission: Admission) -> Self {
@@ -274,31 +298,22 @@ impl ControlPlaneClient {
         let keypair = SessionKeypair::generate();
         let key = CheckpointKey::generate();
         let id = request_id();
-        let message = Outbound::SessionRequest(wire::SessionRequest {
+        let session_request = |ledger: Option<wire::LedgerAccess>| wire::SessionRequest {
             request_id: id.to_string(),
             preferred_country: request.country.map(|c| c.to_string()).unwrap_or_default(),
             session_public_key: keypair.public_key().to_vec(),
             region_hint: request.cover.clone().unwrap_or_default(),
             checkpoint_public_key: key.public_key().to_vec(),
             chained: request.exit_leg,
-            access,
-            permission,
+            access: access.clone(),
+            permission: permission.clone(),
             node_star_id: request.node.map_or(0, |n| n.0),
-        });
-        let answer = exchange(
-            self,
-            Conversation {
-                auth,
-                request: Some(&id),
-                messages: vec![message],
-            },
-            |m| match m {
-                Inbound::SessionCredentials(c) if c.request_id == id.as_str() => Step::Done(Ok(c)),
-                _ => Step::Skip,
-            },
-        )
-        .await
-        .map_err(NotOpened::refused)?;
+            ledger,
+        };
+        let answer = self
+            .ask(&request.admission, &session_request, &keypair, &id, auth)
+            .await
+            .map_err(NotOpened::refused)?;
 
         // From here on the Control Plane has admitted the session: whatever
         // fails now, the permission it was admitted on is spent.
@@ -341,6 +356,65 @@ impl ControlPlaneClient {
         })
     }
 
+    /// Sends the session request and waits for the node's sealed answer: in
+    /// one turn, or — on a right — in two on one stream, the challenge and
+    /// then the request it is signed into.
+    async fn ask(
+        &self,
+        admission: &Admission,
+        session_request: &dyn Fn(Option<wire::LedgerAccess>) -> wire::SessionRequest,
+        keypair: &SessionKeypair,
+        id: &RequestId,
+        auth: Option<&WalletAuth>,
+    ) -> Result<wire::SessionCredentials, ClientError> {
+        let credentials = |m: &Inbound| match m {
+            Inbound::SessionCredentials(c) if c.request_id == id.as_str() => Some(c.clone()),
+            _ => None,
+        };
+        let Admission::Right { right, key, params } = admission else {
+            let request = Outbound::SessionRequest(session_request(None));
+            return exchange(
+                self,
+                Conversation {
+                    auth,
+                    request: Some(id),
+                    messages: vec![request],
+                },
+                |m| credentials(&m).map_or(Step::Skip, |c| Step::Done(Ok(c))),
+            )
+            .await;
+        };
+        let opening = Outbound::LedgerChallenge(wire::LedgerChallengeRequest {
+            request_id: id.to_string(),
+        });
+        dialogue(
+            self,
+            Conversation {
+                auth: None,
+                request: Some(id),
+                messages: vec![opening],
+            },
+            |m| {
+                if let Some(c) = credentials(&m) {
+                    return Turn::Done(Ok(c));
+                }
+                let Inbound::LedgerChallenge(c) = m else {
+                    return Turn::Skip;
+                };
+                if c.request_id != id.as_str() {
+                    return Turn::Skip;
+                }
+                match self.sign_challenge(right, key, *params, &c, keypair) {
+                    Ok(ledger) => Turn::Send(Box::new(Outbound::SessionRequest(session_request(
+                        Some(ledger),
+                    )))),
+                    Err(e) => Turn::Done(Err(e)),
+                }
+            },
+        )
+        .await
+    }
+
     /// The wire fields `admission` fills in, after checking a proof is for
     /// this Control Plane.
     fn admission<'a>(&self, admission: &'a Admission) -> Result<Admitted<'a>, ClientError> {
@@ -370,7 +444,39 @@ impl ControlPlaneClient {
                 permission: None,
                 auth: Some(auth),
             }),
+            Admission::Right { .. } => Ok(Admitted {
+                access: None,
+                permission: None,
+                auth: None,
+            }),
         }
+    }
+
+    /// The `LedgerAccess` for `challenge`: the right, and its key's signature
+    /// over the challenge, this Control Plane and the session key.
+    fn sign_challenge(
+        &self,
+        right: &Right,
+        key: &RightKey,
+        params: JournalParams,
+        challenge: &wire::LedgerChallenge,
+        keypair: &SessionKeypair,
+    ) -> Result<wire::LedgerAccess, ClientError> {
+        if challenge.cp_star_id != self.star.0 {
+            // The signature names the Control Plane; one answering as
+            // another would get a signature good only there.
+            return Err(ClientError::Untrusted(
+                "the challenge names another Control Plane",
+            ));
+        }
+        let bytes = <[u8; 32]>::try_from(challenge.challenge.as_slice())
+            .map_err(|_| ClientError::Malformed("a challenge is 32 bytes"))?;
+        let signature = key.sign_open(params, &bytes, self.star, &keypair.public_key());
+        Ok(wire::LedgerAccess {
+            right: right.encode(),
+            challenge: bytes.to_vec(),
+            signature: signature.to_vec(),
+        })
     }
 
     /// Reports the traffic `session` has carried so far.

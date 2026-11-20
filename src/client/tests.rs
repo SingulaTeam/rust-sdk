@@ -1105,3 +1105,202 @@ async fn reaches_a_control_plane_through_a_transport_the_application_gives() {
     });
     assert!(cp.health().await.expect("answers").healthy);
 }
+
+// ── The shared journal ──────────────────────────────────────────────────────
+
+mod journal {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::client::testing::Acks;
+    use crate::id::{SessionId, StarId, UnixTime};
+    use crate::journal::{
+        AckError, CloseReason, JournalParams, Nullifier, Ping, Right, RightKey, SessionStatus,
+    };
+
+    const PARAMS: JournalParams = JournalParams::new(testing::CHAIN_ID);
+
+    /// A right of the test identity's day, with its key. The test Control
+    /// Plane checks the key's signatures, not the proof.
+    fn right(nullifier: u8) -> (Right, Arc<RightKey>) {
+        let key = RightKey::derive(&[nullifier; 32], PARAMS, Epoch(window())).expect("derives");
+        let right = Right::new(
+            Epoch(window()),
+            0,
+            Nullifier([nullifier; 32]),
+            key.public_key(),
+            [[0; 32]; 8],
+        );
+        (right, Arc::new(key))
+    }
+
+    fn ping(
+        right: &Right,
+        key: &RightKey,
+        session: &SessionId,
+        total: u64,
+    ) -> crate::journal::SignedPing {
+        key.sign_ping(
+            PARAMS,
+            Ping::new(right.window, right.nullifier, session.clone(), NODE, total),
+        )
+    }
+
+    #[tokio::test]
+    async fn opens_a_session_on_a_right() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (right, key) = right(5);
+        let session = cp
+            .open_session(&chain, SessionRequest::on_right(right.clone(), key, PARAMS))
+            .await
+            .expect("the right opens a session");
+        let tunnel = TunnelSettings::decode(session.credentials()).expect("decodes");
+        assert_eq!(tunnel.address, NODE_ADDRESS);
+        let s = mock.state();
+        assert_eq!(s.journal.opened_on_right, 1);
+        assert!(s.journal.rights.contains_key(&right.nullifier.0));
+        assert_eq!(s.permissions_seen, 0, "no permission is spent");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_challenge_naming_another_control_plane() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        mock.state().journal.challenge_names = StarId(99);
+        let (right, key) = right(5);
+        let result = cp
+            .open_session(&chain, SessionRequest::on_right(right, key, PARAMS))
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::Untrusted(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            mock.state().journal.opened_on_right,
+            0,
+            "nothing was signed for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_committed_by_a_checked_majority() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (right, key) = right(5);
+        let session = cp
+            .open_session(
+                &chain,
+                SessionRequest::on_right(right.clone(), Arc::clone(&key), PARAMS),
+            )
+            .await
+            .expect("opens");
+        let versions = mock.state().journal.versions();
+        let signed = ping(&right, &key, session.id(), 300);
+        let traffic = Traffic { up: 10, down: 20 };
+
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        let committed = ack
+            .committed(&versions, PARAMS, UnixTime::now())
+            .expect("a majority");
+        assert_eq!(committed.version, versions.latest().id);
+        assert_eq!(
+            mock.state().journal.pings.last().map(|p| p.total),
+            Some(300)
+        );
+
+        mock.state().journal.acks = Acks::Short;
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        assert!(matches!(
+            ack.committed(&versions, PARAMS, UnixTime::now()),
+            Err(AckError::NoQuorum { .. })
+        ));
+
+        mock.state().journal.acks = Acks::Forged;
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        assert!(matches!(
+            ack.committed(&versions, PARAMS, UnixTime::now()),
+            Err(AckError::BadAttestation(_))
+        ));
+
+        mock.state().journal.acks = Acks::OtherPing;
+        let result = cp.ping(PARAMS, &signed, traffic, None).await;
+        assert!(
+            matches!(result, Err(ClientError::Untrusted(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_days_right_travels_with_its_first_ping() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (today, key) = right(5);
+        let session = cp
+            .open_session(&chain, SessionRequest::on_right(today, key, PARAMS))
+            .await
+            .expect("opens");
+        let (tomorrow, next_key) = right(6);
+        let first = ping(&tomorrow, &next_key, session.id(), 30);
+
+        let refused = cp.ping(PARAMS, &first, Traffic::default(), None).await;
+        assert!(
+            matches!(refused, Err(ClientError::Refused { .. })),
+            "an unknown right's ping"
+        );
+        cp.ping(PARAMS, &first, Traffic::default(), Some(&tomorrow))
+            .await
+            .expect("taken with its right");
+        assert!(
+            mock.state()
+                .journal
+                .rights
+                .contains_key(&tomorrow.nullifier.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn says_why_a_session_closed() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, _) = setup(wallet).await;
+        let open: SessionId = "8f14e45f-ceea-467f-a8d5-000000000001"
+            .parse()
+            .expect("an id");
+        let closed: SessionId = "8f14e45f-ceea-467f-a8d5-000000000002"
+            .parse()
+            .expect("an id");
+        let unknown: SessionId = "8f14e45f-ceea-467f-a8d5-000000000003"
+            .parse()
+            .expect("an id");
+        {
+            let mut s = mock.state();
+            s.journal
+                .statuses
+                .insert(open.to_string(), (1, String::new()));
+            s.journal
+                .statuses
+                .insert(closed.to_string(), (2, "overlap".into()));
+        }
+        assert!(matches!(
+            cp.session_status(&open).await,
+            Ok(SessionStatus::Open { .. })
+        ));
+        assert_eq!(
+            cp.session_status(&closed).await.expect("answers"),
+            SessionStatus::Closed(CloseReason::Overlap)
+        );
+        assert_eq!(
+            cp.session_status(&unknown).await.expect("answers"),
+            SessionStatus::Unknown
+        );
+    }
+}
