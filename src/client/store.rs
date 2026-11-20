@@ -1,11 +1,7 @@
 //! Where the SDK keeps what must outlive the process.
 //!
-//! A subscriber's identity, a week-long sign-in, this window's permissions
-//! and which of them are held, the quota slots already used: each is cheap
-//! to keep and expensive to lose. A lost permission cannot be taken again
-//! until the window turns, because each of a subscription's indices is taken
-//! once per window network-wide; a lost sign-in or identity costs the person
-//! another wallet prompt.
+//! A subscriber's identity and a week-long sign-in: each is cheap to keep,
+//! and losing one costs the person another wallet prompt.
 //!
 //! The application decides where these live — a keychain, the platform
 //! keystore, a database — by implementing [`Store`]. The SDK decides what is
@@ -35,21 +31,14 @@ impl Key {
         Self { name, secret: true }
     }
 
-    pub(crate) fn plain(name: String) -> Self {
-        Self {
-            name,
-            secret: false,
-        }
-    }
-
-    /// The name, such as `packet` or `slots/8/137`.
+    /// The name, such as `identity/<wallet>`.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.name
     }
 
     /// Whether the value lets its holder act as the subscriber: an identity
-    /// secret, a sign-in, permissions.
+    /// secret or a sign-in.
     #[must_use]
     pub fn is_secret(&self) -> bool {
         self.secret
@@ -258,7 +247,7 @@ mod tests {
     use super::*;
 
     async fn round_trip<S: Store>(store: &S) {
-        let key = Key::plain("slots/8/137".into());
+        let key = Key::secret("sign-in/8/abc".into());
         assert_eq!(store.get(&key).await.expect("reads"), None);
         store.put(&key, b"3").await.expect("writes");
         store.put(&key, b"4").await.expect("overwrites");
@@ -307,7 +296,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("singula-store-escape-{}", std::process::id()));
         let store = FileStore::new(&dir).expect("a directory");
         for name in ["../x", "a/../../x", "/etc/passwd", "a//b", "A"] {
-            let key = Key::plain(name.into());
+            let key = Key::secret(name.into());
             assert!(
                 matches!(store.put(&key, b"x").await, Err(StoreError::Corrupt(_))),
                 "{name}"

@@ -5,8 +5,9 @@
 #![allow(missing_docs, clippy::expect_used)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use singula::Epoch;
+use singula::journal::JournalParams;
 use singula::zk::{Claim, FieldElement, Group, Identity, Prover};
-use singula::{Epoch, StarId};
 
 fn prove(c: &mut Criterion) {
     let identity = Identity::from_signature("0xbench");
@@ -20,10 +21,12 @@ fn prove(c: &mut Criterion) {
         return;
     };
     let Ok(prover) = Prover::new() else { return };
-    let claim = Claim::Session {
-        control_plane: StarId(7),
-        epoch: Epoch(137),
-        index: 0,
+    let key = identity
+        .right_key(JournalParams::new(421_614), Epoch(170))
+        .expect("derives");
+    let claim = Claim::Right {
+        window: Epoch(170),
+        key: key.public_key(),
     };
 
     c.bench_function("load the circuit", |b| b.iter(Prover::new));

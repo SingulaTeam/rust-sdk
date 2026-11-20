@@ -32,7 +32,8 @@ pub(crate) const GRAPH: &[u8] = include_bytes!("../../zk/semaphore-16.graph");
 /// # Examples
 ///
 /// ```no_run
-/// # use singula::{Epoch, StarId};
+/// # use singula::Epoch;
+/// # use singula::journal::JournalParams;
 /// # use singula::zk::{Claim, Group, Identity, Prover};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # let signature = String::new();
@@ -40,11 +41,9 @@ pub(crate) const GRAPH: &[u8] = include_bytes!("../../zk/semaphore-16.graph");
 /// let prover = Prover::new()?;
 /// let identity = Identity::from_signature(&signature);
 /// let group = Group::new(&members)?;
-/// let proof = prover.prove(
-///     &identity,
-///     &group,
-///     Claim::Session { control_plane: StarId(7), epoch: Epoch(137), index: 0 },
-/// )?;
+/// let key = identity.right_key(JournalParams::new(421_614), Epoch(170))?;
+/// let claim = Claim::Right { window: Epoch(170), key: key.public_key() };
+/// let proof = prover.prove(&identity, &group, claim)?;
 /// # let _ = proof;
 /// # Ok(())
 /// # }
@@ -105,19 +104,17 @@ pub struct AccessProof {
 
 impl AccessProof {
     /// The day's [`Right`] this proof makes, against the window's tree state
-    /// `state_index`; `None` unless it was made for a [`Claim::Right`].
+    /// `state_index`.
     #[must_use]
-    pub fn to_right(&self, state_index: u32) -> Option<Right> {
-        let Claim::Right { window, key } = self.claim else {
-            return None;
-        };
-        Some(Right::new(
+    pub fn to_right(&self, state_index: u32) -> Right {
+        let Claim::Right { window, key } = self.claim;
+        Right::new(
             window,
             state_index,
             Nullifier(self.nullifier.to_be_bytes()),
             key,
             self.points,
-        ))
+        )
     }
 }
 

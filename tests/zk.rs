@@ -16,8 +16,8 @@ use std::str::FromStr as _;
 use ark_ff::PrimeField as _;
 use ark_groth16::{Groth16, PreparedVerifyingKey, Proof, VerifyingKey, prepare_verifying_key};
 use serde_json::Value;
+use singula::Epoch;
 use singula::zk::{AccessProof, Claim, FieldElement, Group, Identity, Prover};
-use singula::{Epoch, StarId};
 
 /// The JavaScript client's identity, and the group it was tested in.
 const SECRET: &str = "0x08207bd92786697f8bed5caf78eda4d3b78fbc3326eb624744b966e7f94f5f59";
@@ -27,24 +27,6 @@ const MEMBERS: [&str; 4] = [
     "333",
     "15653118452981836033022399046009658219270373379659789120083529738828725496177",
 ];
-
-/// The Control Plane's `SemaphoreHash` of the claims below.
-const SESSION_MESSAGE: &str =
-    "343371210433890290056162609015838183378480827683322587048381917224414179832";
-const SESSION_SCOPE: &str =
-    "144238274787227100379747289347751931288527938002097690447946830657197365998";
-const PACKET_SCOPE: &str =
-    "215721150169798234869930996536229829395638981024187311208781748876391599088";
-
-const SESSION: Claim = Claim::Session {
-    control_plane: StarId(7),
-    epoch: Epoch(137),
-    index: 3,
-};
-const PACKET: Claim = Claim::Permission {
-    window: Epoch(137),
-    index: 3,
-};
 
 struct Setup {
     prover: Prover,
@@ -100,6 +82,10 @@ const RIGHT_MESSAGE: &str =
     "52204751582231114037403491615054938693844254530108889856078236979011909626";
 
 fn right_claim(key: (&str, &str)) -> Claim {
+    right_claim_on(Epoch(10), key)
+}
+
+fn right_claim_on(window: Epoch, key: (&str, &str)) -> Claim {
     let bytes = |s: &str| -> [u8; 32] {
         hex::decode(s)
             .expect("valid hex")
@@ -107,7 +93,7 @@ fn right_claim(key: (&str, &str)) -> Claim {
             .expect("32 bytes")
     };
     Claim::Right {
-        window: Epoch(10),
+        window,
         key: (bytes(key.0), bytes(key.1)),
     }
 }
@@ -117,12 +103,8 @@ fn a_right_proof_passes_the_control_planes_check() {
     let s = Setup::new();
     let proof = s.prove(right_claim(RIGHT_KEY));
     assert!(s.verifies(&proof, RIGHT_MESSAGE, RIGHT_SCOPE));
-    let right = proof.to_right(0).expect("a right claim makes a right");
+    let right = proof.to_right(0);
     assert_eq!(right.nullifier.0, proof.nullifier.to_be_bytes());
-    assert!(
-        s.prove(SESSION).to_right(0).is_none(),
-        "only a right claim does"
-    );
 
     // One slot, one nullifier a day, whatever key it delegates to.
     let other_key = s.prove(right_claim((RIGHT_KEY.1, RIGHT_KEY.0)));
@@ -165,55 +147,29 @@ fn the_fixtures_right_verifies_as_we_hash_it() {
 }
 
 #[test]
-fn a_session_proof_passes_the_control_planes_check() {
-    let s = Setup::new();
-    let proof = s.prove(SESSION);
-    assert_eq!(proof.merkle_root, s.group.root());
-    assert!(s.verifies(&proof, SESSION_MESSAGE, SESSION_SCOPE));
-}
-
-#[test]
-fn a_packet_proof_passes_the_control_planes_check() {
-    let s = Setup::new();
-    let proof = s.prove(PACKET);
-    assert!(s.verifies(&proof, PACKET_SCOPE, PACKET_SCOPE));
-}
-
-#[test]
-fn a_proof_is_good_for_its_own_claim_only() {
-    let s = Setup::new();
-    let session = s.prove(SESSION);
-    assert!(!s.verifies(&session, PACKET_SCOPE, PACKET_SCOPE));
-    // The same slot at another Control Plane or in another epoch has another scope.
-    let other = s.prove(Claim::Session {
-        control_plane: StarId(8),
-        epoch: Epoch(137),
-        index: 3,
-    });
-    assert!(!s.verifies(&other, SESSION_MESSAGE, SESSION_SCOPE));
-}
-
-#[test]
 fn the_nullifier_is_fixed_by_the_claim() {
     let s = Setup::new();
-    let (first, again) = (s.prove(SESSION), s.prove(SESSION));
-    assert_eq!(
-        first.nullifier, again.nullifier,
-        "the same slot cannot be spent twice"
-    );
+    let claim = right_claim(RIGHT_KEY);
+    let (first, again) = (s.prove(claim), s.prove(claim));
+    assert_eq!(first.nullifier, again.nullifier, "one right per slot a day");
     assert_ne!(
         first.points, again.points,
         "proofs are randomised, so they do not link"
     );
-    assert_ne!(first.nullifier, s.prove(PACKET).nullifier);
+    let tomorrow = right_claim_on(Epoch(11), RIGHT_KEY);
+    assert_ne!(
+        first.nullifier,
+        s.prove(tomorrow).nullifier,
+        "days do not link"
+    );
 }
 
 #[test]
 fn an_altered_proof_fails() {
     let s = Setup::new();
-    let mut proof = s.prove(SESSION);
+    let mut proof = s.prove(right_claim(RIGHT_KEY));
     proof.points.swap(2, 3);
-    assert!(!s.verifies(&proof, SESSION_MESSAGE, SESSION_SCOPE));
+    assert!(!s.verifies(&proof, RIGHT_MESSAGE, RIGHT_SCOPE));
 }
 
 #[test]
@@ -221,7 +177,7 @@ fn a_stranger_cannot_prove() {
     let s = Setup::new();
     let stranger = Identity::from_signature("0x00");
     assert!(matches!(
-        s.prover.prove(&stranger, &s.group, SESSION),
+        s.prover.prove(&stranger, &s.group, right_claim(RIGHT_KEY)),
         Err(singula::zk::ProveError::NotAMember)
     ));
 }

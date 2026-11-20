@@ -20,13 +20,11 @@ default = []
 chain = ["dep:alloy-primitives", "dep:alloy-sol-types"]
 ## A JSON-RPC transport over HTTPS for `chain`.
 http = ["chain", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:webpki-root-certs"]
-## Talking to Control Planes: permissions, nodes, sessions, reports and
-## renewals, over gRPC with TLS.
+## Talking to Control Planes: nodes, sessions on a day's right and their
+## pings, wallet sessions, over gRPC with TLS.
 client = [
     "chain",
     "zk",
-    "dep:blind-rsa-signatures",
-    "dep:rsa",
     "dep:hyper-util",
     "dep:prost",
     "dep:serde",
@@ -76,12 +74,6 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 
 # client
-blind-rsa-signatures = { version = "0.18", optional = true }
-# Not used directly. blind-rsa-signatures takes any rsa 0.10 pre-release, and
-# 0.10.0-rc.21 changed the traits it implements, so a dependent resolving its
-# dependencies afresh would fail to build. Pinned to the last one that works;
-# remove once blind-rsa-signatures builds on the newest rsa.
-rsa = { version = "=0.10.0-rc.19", optional = true, default-features = false }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["tokio"] }
 prost = { version = "0.14", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }

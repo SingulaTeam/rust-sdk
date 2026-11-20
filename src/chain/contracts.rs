@@ -133,10 +133,4 @@ alloy_sol_types::sol! {
             address wallet, uint256 tokenId, uint256[] calldata commitments, uint256 deadline, bytes calldata signature
         ) external;
     }
-
-    interface IVoucherKeyRegistry {
-        function getEpochKey(uint256 issuerStarId, uint256 epoch) external view returns (
-            bytes32 keyHash, uint32 denominationGB, uint64 setAt, bool issuerActive
-        );
-    }
 }

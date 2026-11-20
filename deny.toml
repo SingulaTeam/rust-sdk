@@ -8,10 +8,6 @@ all-features = true
 # Every RustSec advisory fails the build; an exception needs an entry here
 # with the reason it does not apply to this crate.
 ignore = [
-    # RSA private-key timing (Marvin), in `rsa` via blind-rsa-signatures. The
-    # client only blinds, unblinds and verifies — public-key operations; the
-    # private key is the issuer's and never in this process.
-    { id = "RUSTSEC-2023-0071", reason = "public-key operations only" },
     # ANSI injection in tracing-subscriber 0.2, pulled in by arkworks'
     # ark-relations for constraint tracing. This crate never installs a
     # tracing subscriber, so nothing reaches it.

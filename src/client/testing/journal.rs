@@ -33,6 +33,7 @@ pub(in crate::client) enum Acks {
 }
 
 /// What the test federation keeps of the journal.
+#[derive(Clone)]
 pub(in crate::client) struct MockJournal {
     pub(in crate::client) params: JournalParams,
     /// Its Control Planes: this one first.
@@ -74,6 +75,18 @@ impl MockJournal {
             challenge_names: CP,
             opened_on_right: 0,
         }
+    }
+
+    /// Its Control Planes and their signers, as `StarRegistry` would list
+    /// them.
+    pub(in crate::client) fn members(&self) -> Vec<(StarId, Address)> {
+        self.version.control_planes.clone()
+    }
+
+    /// Takes `version` — the federation's set as the chain recorded it —
+    /// as the one its attestations name.
+    pub(in crate::client) fn recorded_as(&mut self, version: RegistryVersion) {
+        self.version = version;
     }
 
     /// The registry's history, as the client reads it from the chain.

@@ -4,7 +4,6 @@ use super::auth::WalletAuth;
 use std::sync::Arc;
 
 use super::call::{Conversation, Step, Turn, dialogue, exchange, request_id};
-use super::permission::Permission;
 use super::proto::client::client_message::Message as Outbound;
 use super::proto::client::control_plane_message::Message as Inbound;
 use super::proto::client::{
@@ -13,11 +12,10 @@ use super::proto::client::{
 use super::{ClientError, ControlPlaneClient, Country};
 use crate::chain::{Chain, Role, Rpc};
 use crate::digest::{Checkpoint, Ending, Renewal};
-use crate::id::{Address, Epoch, RequestId, SessionId, StarId, UnixTime};
+use crate::id::{Address, RequestId, SessionId, StarId, UnixTime};
 use crate::journal::{JournalParams, Right, RightKey};
 use crate::session::{Credentials, SealedCredentials, SessionKeypair};
 use crate::signing::CheckpointKey;
-use crate::zk::{AccessProof, Claim};
 
 /// How long a signed end may take to be answered.
 const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -25,11 +23,12 @@ const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// What to ask for when opening a session.
 ///
 /// ```no_run
-/// # use singula::client::{Permission, SessionRequest};
-/// # use singula::zk::AccessProof;
+/// # use std::sync::Arc;
+/// # use singula::client::SessionRequest;
+/// # use singula::journal::{JournalParams, Right, RightKey};
 /// # use singula::StarId;
-/// # fn f(proof: AccessProof, permission: Permission) -> Result<(), Box<dyn std::error::Error>> {
-/// let request = SessionRequest::anonymous(proof, permission)
+/// # fn f(right: Right, key: Arc<RightKey>) -> Result<(), Box<dyn std::error::Error>> {
+/// let request = SessionRequest::on_right(right, key, JournalParams::new(421_614))
 ///     .node(StarId(12))
 ///     .country("DE".parse()?);
 /// # let _ = request;
@@ -49,13 +48,6 @@ pub struct SessionRequest {
 /// How a session is admitted.
 #[derive(Debug, Clone)]
 enum Admission {
-    /// By a membership proof and a permission: the Control Plane learns that
-    /// some subscriber connected, and nothing else.
-    Anonymous {
-        // Boxed: a proof is several hundred bytes, a sign-in a few dozen.
-        proof: Box<AccessProof>,
-        permission: Permission,
-    },
     /// By the wallet's sign-in: the Control Plane knows which wallet.
     Wallet(WalletAuth),
     /// By the day's right of one of the subscriber's slots, and a signature
@@ -67,24 +59,7 @@ enum Admission {
     },
 }
 
-/// What an [`Admission`] puts on the wire.
-struct Admitted<'a> {
-    access: Option<wire::AccessProof>,
-    permission: Option<wire::Permission>,
-    auth: Option<&'a WalletAuth>,
-}
-
 impl SessionRequest {
-    /// An anonymous session, admitted by `proof` — a [`Claim::Session`]
-    /// proof for the Control Plane it is sent to — and paid for with
-    /// `permission`.
-    pub fn anonymous(proof: AccessProof, permission: Permission) -> Self {
-        Self::with(Admission::Anonymous {
-            proof: Box::new(proof),
-            permission,
-        })
-    }
-
     /// A session admitted by a wallet's sign-in. The Control Plane checks
     /// the wallet's subscription on chain, and knows whose session it is.
     pub fn wallet(auth: WalletAuth) -> Self {
@@ -241,8 +216,8 @@ impl Session {
 #[derive(Debug)]
 pub(super) struct NotOpened {
     pub(super) error: ClientError,
-    /// Whether the Control Plane admitted it — and so took its permission —
-    /// before the client refused the answer.
+    /// Whether the Control Plane admitted it before the client refused the
+    /// answer.
     pub(super) admitted: bool,
     /// The node the refused answer names, when it names one.
     pub(super) node: Option<StarId>,
@@ -287,14 +262,10 @@ impl ControlPlaneClient {
         chain: &Chain<R>,
         request: SessionRequest,
     ) -> Result<Session, NotOpened> {
-        let Admitted {
-            access,
-            permission,
-            auth,
-        } = self
-            .admission(&request.admission)
-            .map_err(NotOpened::refused)?;
-
+        let auth = match &request.admission {
+            Admission::Wallet(auth) => Some(auth),
+            Admission::Right { .. } => None,
+        };
         let keypair = SessionKeypair::generate();
         let key = CheckpointKey::generate();
         let id = request_id();
@@ -305,8 +276,8 @@ impl ControlPlaneClient {
             region_hint: request.cover.clone().unwrap_or_default(),
             checkpoint_public_key: key.public_key().to_vec(),
             chained: request.exit_leg,
-            access: access.clone(),
-            permission: permission.clone(),
+            access: None,
+            permission: None,
             node_star_id: request.node.map_or(0, |n| n.0),
             ledger,
         };
@@ -315,14 +286,12 @@ impl ControlPlaneClient {
             .await
             .map_err(NotOpened::refused)?;
 
-        // From here on the Control Plane has admitted the session: whatever
-        // fails now, the permission it was admitted on is spent.
+        // From here on the Control Plane has admitted the session.
         let (session, node, credentials) =
             match verify(chain, &keypair, request.node, &answer).await {
                 Ok(opened) => opened,
                 Err(error) => {
-                    // Ended at once, so the permission it holds is free again
-                    // within a lease rather than when the session would expire.
+                    // Ended at once rather than left to time out on the node.
                     if let Ok(id) = answer.session_uuid.parse::<SessionId>() {
                         let _ = self.end_signed(&id, &key, Traffic::default()).await;
                     }
@@ -415,43 +384,6 @@ impl ControlPlaneClient {
         .await
     }
 
-    /// The wire fields `admission` fills in, after checking a proof is for
-    /// this Control Plane.
-    fn admission<'a>(&self, admission: &'a Admission) -> Result<Admitted<'a>, ClientError> {
-        match admission {
-            Admission::Anonymous { proof, permission } => {
-                let Claim::Session {
-                    control_plane,
-                    epoch,
-                    index,
-                } = proof.claim
-                else {
-                    return Err(ClientError::Mismatch("the proof is not a session proof"));
-                };
-                if control_plane != self.star {
-                    return Err(ClientError::Mismatch(
-                        "the proof is for another Control Plane",
-                    ));
-                }
-                Ok(Admitted {
-                    access: Some(wire_proof(proof, epoch, index)),
-                    permission: Some(permission.to_wire()),
-                    auth: None,
-                })
-            }
-            Admission::Wallet(auth) => Ok(Admitted {
-                access: None,
-                permission: None,
-                auth: Some(auth),
-            }),
-            Admission::Right { .. } => Ok(Admitted {
-                access: None,
-                permission: None,
-                auth: None,
-            }),
-        }
-    }
-
     /// The `LedgerAccess` for `challenge`: the right, and its key's signature
     /// over the challenge, this Control Plane and the session key.
     fn sign_challenge(
@@ -538,22 +470,15 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// Extends `session` before it expires.
-    ///
-    /// Inside the window it was admitted in, the session's signature is
-    /// enough; renewing into a new window takes a `permission` from that
-    /// window's packet.
+    /// Extends a wallet's `session` before it expires, by the session's
+    /// signature. A session on a right needs no renewal: its pings keep it.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Mismatch`] if this is not the session's
     /// admitting Control Plane, [`ClientError::Refused`] if renewal is
     /// declined, and any error of the call.
-    pub async fn renew(
-        &self,
-        session: &mut Session,
-        permission: Option<&Permission>,
-    ) -> Result<(), ClientError> {
+    pub async fn renew(&self, session: &mut Session) -> Result<(), ClientError> {
         if session.admitted_by != self.star {
             return Err(ClientError::Mismatch(
                 "this session was admitted by another Control Plane",
@@ -570,7 +495,7 @@ impl ControlPlaneClient {
         let message = Outbound::RenewSession(RenewSessionRequest {
             request_id: id.to_string(),
             session_uuid: session.id.to_string(),
-            permission: permission.map(Permission::to_wire),
+            permission: None,
             signature: session.key.sign(&digest).to_bytes().to_vec(),
             timestamp: timestamp.0,
         });
@@ -602,8 +527,8 @@ impl ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
-    /// Ends an anonymous session now, signed by the session's own key, so
-    /// its permission is free again across the network within one lease.
+    /// Ends an anonymous session now, signed by the session's own key,
+    /// rather than leaving it to time out.
     ///
     /// An anonymous session has no wallet to vouch for its end; its key is
     /// what ties a call to it, over any stream.
@@ -769,15 +694,4 @@ async fn verify<R: Rpc>(
         &star.signer,
     )?;
     Ok((session, node, credentials))
-}
-
-/// A proof as the wire carries it: field elements as 32 bytes big-endian.
-pub(super) fn wire_proof(proof: &AccessProof, epoch: Epoch, index: u32) -> wire::AccessProof {
-    wire::AccessProof {
-        epoch: epoch.0,
-        merkle_root: proof.merkle_root.to_be_bytes().to_vec(),
-        nullifier: proof.nullifier.to_be_bytes().to_vec(),
-        index,
-        points: proof.points.iter().map(|p| p.to_vec()).collect(),
-    }
 }

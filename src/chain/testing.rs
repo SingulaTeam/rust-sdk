@@ -22,6 +22,8 @@ pub(crate) struct MockRpc {
     pub(crate) max_span: u64,
     /// How many log queries were made.
     pub(crate) log_queries: Mutex<u32>,
+    /// Block timestamps set by a test; others are 1000 plus the number.
+    pub(crate) times: HashMap<u64, i64>,
 }
 
 impl MockRpc {
@@ -35,6 +37,7 @@ impl MockRpc {
             logs: Vec::new(),
             max_span: u64::MAX,
             log_queries: Mutex::new(0),
+            times: HashMap::new(),
         }
     }
 
@@ -90,7 +93,11 @@ impl Rpc for MockRpc {
             Block::Finalized => self.finalized.unwrap_or(self.block),
             _ => self.block,
         };
-        std::future::ready(Ok(Self::header_of(number)))
+        let mut header = Self::header_of(number);
+        if let Some(t) = self.times.get(&number) {
+            header.timestamp = UnixTime(*t);
+        }
+        std::future::ready(Ok(header))
     }
 
     fn logs(&self, filter: &LogFilter) -> impl Future<Output = Result<Vec<Log>, RpcError>> + Send {

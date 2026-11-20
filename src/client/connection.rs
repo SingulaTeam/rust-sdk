@@ -1,29 +1,32 @@
 //! A session kept alive: reported on and renewed in the background.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::connect::{Identities, Singula};
-use super::ledger::Lease;
+use super::connect::Singula;
 use super::session::{Session, Traffic};
 use super::store::Store;
 use super::{ClientError, ControlPlaneClient, TunnelSettings, WalletAuth};
 use crate::chain::Rpc;
 use crate::id::{SessionId, StarId, UnixTime};
+use crate::journal::{CloseReason, Committed};
 
 /// How many events wait for the application before the oldest are dropped.
-const EVENT_BUFFER: usize = 32;
+pub(super) const EVENT_BUFFER: usize = 32;
 
-/// How often a connection reports and when it renews.
+/// How often a connection pings, reports and renews.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Timing {
-    /// Between traffic reports. Reports are what the node is paid for, and
-    /// what keeps the session's nonce fresh.
+    /// Between pings of a session on a right. Pings are what the node is paid
+    /// for: the seconds after the last one are not counted. Control Planes
+    /// close a session no ping was recorded for in ten minutes.
+    pub ping_every: Duration,
+    /// Between traffic reports of a wallet's session. Reports are what keeps
+    /// the session's nonce fresh.
     pub report_every: Duration,
     /// How long before expiry renewal starts.
     pub renew_ahead: Duration,
@@ -34,6 +37,7 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
+            ping_every: Duration::from_secs(5 * 60),
             report_every: Duration::from_secs(30),
             renew_ahead: Duration::from_secs(10 * 60),
             renew_retry: Duration::from_secs(60),
@@ -61,6 +65,25 @@ impl<F: Fn() -> Traffic + Send + Sync + 'static> TrafficMeter for F {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event {
+    /// A ping reached the journal: a strict majority of the Control Planes
+    /// recorded it, as checked against the chain.
+    Pinged {
+        /// The seconds it counted.
+        total: u64,
+        /// When the majority recorded it, and which registry version they
+        /// belong to.
+        committed: Committed,
+        /// The Control Plane it went through.
+        control_plane: StarId,
+    },
+    /// A ping reached no majority through any Control Plane; the next one
+    /// will try again.
+    PingFailed {
+        /// What went wrong at the last Control Plane tried.
+        error: ClientError,
+        /// Failures in a row so far.
+        in_a_row: u32,
+    },
     /// A report was accepted.
     Reported(Traffic),
     /// A report failed; the next one will try again.
@@ -83,13 +106,17 @@ pub enum Event {
 }
 
 /// Why a connection ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EndReason {
     /// The application closed it.
     Closed,
     /// It expired without being renewed.
     Expired,
+    /// The network closed it, for this reason. Show it, and reconnect: a
+    /// new session, on another of the subscription's slots when the reason
+    /// is [`CloseReason::Overlap`].
+    ClosedByNetwork(CloseReason),
 }
 
 /// An open session, kept alive in the background.
@@ -108,6 +135,26 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A connection over a background `task` that sends `events` and stops
+    /// when `stop` fires.
+    pub(super) fn new(
+        parts: Parts,
+        tunnel: TunnelSettings,
+        events: mpsc::Receiver<Event>,
+        stop: oneshot::Sender<()>,
+        task: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            id: parts.id,
+            node: parts.node,
+            control_plane: parts.control_plane,
+            tunnel,
+            events,
+            stop: Some(stop),
+            task: Some(task),
+        }
+    }
+
     /// The session's id.
     #[must_use]
     pub fn id(&self) -> &SessionId {
@@ -138,15 +185,32 @@ impl Connection {
         self.events.recv().await
     }
 
-    /// Ends the session: a wallet's session is ended at the Control Plane, an
-    /// anonymous one is no longer renewed. Either way its permission is
-    /// returned.
+    /// Ends the session at the Control Plane, after a last ping or report
+    /// so its final seconds count.
     pub async fn close(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+    }
+}
+
+/// What a [`Connection`] says about its session, taken before the session
+/// moves into its background task.
+pub(super) struct Parts {
+    id: SessionId,
+    node: StarId,
+    control_plane: StarId,
+}
+
+impl Parts {
+    pub(super) fn of(session: &Session) -> Self {
+        Self {
+            id: session.id().clone(),
+            node: session.node(),
+            control_plane: session.admitted_by(),
         }
     }
 }
@@ -159,29 +223,25 @@ impl Drop for Connection {
     }
 }
 
-/// What the background task holds.
+/// What the background task of a wallet's session holds.
 pub(super) struct Keeper<R, S, M> {
     singula: Singula<R, S>,
     session: Session,
     admitting: ControlPlaneClient,
     reporter: ControlPlaneClient,
-    auth: Option<WalletAuth>,
-    /// The permission the session holds, and the identity to take the next
-    /// window's with.
-    held: Option<(Lease, Identities)>,
+    auth: WalletAuth,
     meter: M,
     timing: Timing,
     events: mpsc::Sender<Event>,
 }
 
-/// A session just opened, and what keeping it needs.
+/// A wallet's session just opened, and what keeping it needs.
 pub(super) struct Opened {
     pub(super) session: Session,
     pub(super) tunnel: TunnelSettings,
     pub(super) admitting: ControlPlaneClient,
     pub(super) reporter: ControlPlaneClient,
-    pub(super) auth: Option<WalletAuth>,
-    pub(super) held: Option<(Lease, Identities)>,
+    pub(super) auth: WalletAuth,
 }
 
 impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
@@ -194,32 +254,19 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
     ) -> Connection {
         let (events, receiver) = mpsc::channel(EVENT_BUFFER);
         let (stop, stopped) = oneshot::channel();
-        let connection_parts = (
-            opened.session.id().clone(),
-            opened.session.node(),
-            opened.admitting.star(),
-        );
+        let parts = Parts::of(&opened.session);
         let keeper = Self {
             singula,
             session: opened.session,
             admitting: opened.admitting,
             reporter: opened.reporter,
             auth: opened.auth,
-            held: opened.held,
             meter,
             timing,
             events,
         };
         let task = tokio::spawn(keeper.run(stopped));
-        Connection {
-            id: connection_parts.0,
-            node: connection_parts.1,
-            control_plane: connection_parts.2,
-            tunnel: opened.tunnel,
-            events: receiver,
-            stop: Some(stop),
-            task: Some(task),
-        }
+        Connection::new(parts, opened.tunnel, receiver, stop, task)
     }
 
     async fn run(mut self, mut stopped: oneshot::Receiver<()>) {
@@ -240,7 +287,6 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
                     match self.reporter.report(&mut self.session, traffic).await {
                         Ok(()) => {
                             failed_reports = 0;
-                            self.keep_permission().await;
                             self.emit(Event::Reported(traffic));
                         }
                         Err(error) => {
@@ -253,7 +299,7 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
                     if self.singula.now() >= self.session.expires_at() {
                         break EndReason::Expired;
                     }
-                    match self.renew().await {
+                    match self.admitting.renew(&mut self.session).await {
                         Ok(()) => {
                             self.emit(Event::Renewed { expires_at: self.session.expires_at() });
                             renew_at = self.renewal_due();
@@ -269,20 +315,6 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
         self.finish(reason).await;
     }
 
-    /// Records that the session's permission is still held, so it does not
-    /// lapse in the ledger while the session runs.
-    async fn keep_permission(&self) {
-        if let Some((lease, _)) = &self.held {
-            // Best effort: a missed write only lets the hold lapse earlier,
-            // and the next report writes again.
-            let _ = self
-                .singula
-                .ledger()
-                .keep(lease, self.session.id(), self.singula.kept_until())
-                .await;
-        }
-    }
-
     /// When renewal should start: `renew_ahead` before expiry.
     fn renewal_due(&self) -> Instant {
         let left = u64::try_from(self.session.expires_at().0 - self.singula.now().0).unwrap_or(0);
@@ -290,68 +322,14 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Keeper<R, S, M> {
         Instant::now() + wait
     }
 
-    /// Renews the session; into a new window, with a permission of that
-    /// window's packet.
-    async fn renew(&mut self) -> Result<(), ClientError> {
-        let Some((lease, identities)) = &self.held else {
-            return self.admitting.renew(&mut self.session, None).await;
-        };
-        let window = self.singula.current_epoch()?;
-        if window == lease.window {
-            return self.admitting.renew(&mut self.session, None).await;
-        }
-        let identities = Arc::clone(identities);
-        let next = self
-            .singula
-            .lease(&self.admitting, &identities, window)
-            .await?;
-        let ledger = self.singula.ledger();
-        match self
-            .admitting
-            .renew(&mut self.session, Some(&next.permission))
-            .await
-        {
-            Ok(()) => {
-                ledger
-                    .bind(&next, self.session.id(), self.singula.kept_until())
-                    .await?;
-                if let Some((old, _)) = self.held.replace((next, identities)) {
-                    ledger.release(&old).await?;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                // The renewal may have been admitted before it failed.
-                ledger.release_at(&next, self.singula.held_until()).await?;
-                Err(e)
-            }
-        }
-    }
-
     async fn finish(self, reason: EndReason) {
-        let held_until = self.singula.held_until();
-        let ledger = self.singula.ledger();
-        if let Some((lease, _)) = &self.held {
-            // Best effort: a release that fails leaves the permission marked
-            // held until the window turns, which costs concurrency, not access.
-            let _ = ledger.release_at(lease, held_until).await;
-        }
         if reason == EndReason::Closed {
+            // Ended rather than left to expire, with its final traffic.
             let traffic = self.meter.traffic();
-            // Ended rather than left to expire, so its permission is free
-            // again within a lease, not hours.
-            let _ = match &self.auth {
-                Some(auth) => {
-                    self.admitting
-                        .end_session(auth, self.session, traffic)
-                        .await
-                }
-                None => {
-                    self.admitting
-                        .end_anonymous_session(self.session, traffic)
-                        .await
-                }
-            };
+            let _ = self
+                .admitting
+                .end_session(&self.auth, self.session, traffic)
+                .await;
         }
         let _ = self.events.try_send(Event::Ended(reason));
     }
