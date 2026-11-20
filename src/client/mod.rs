@@ -370,6 +370,11 @@ pub enum ClientError {
     /// day, because the Orbit ends during it.
     #[error("this identity is not in the anonymity set for the day")]
     NotRegistered,
+    /// Every slot of the subscription carries one of this client's
+    /// sessions: a slot holds one session at a time, so a route of several
+    /// hops needs as many slots.
+    #[error("every slot of the subscription carries a session already")]
+    NoFreeSlot,
     /// A ping's answer did not show a strict majority of the Control
     /// Planes recorded it.
     #[error("the ping was not recorded by a majority: {0}")]

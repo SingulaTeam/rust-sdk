@@ -18,7 +18,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::connect::Singula;
 use super::connection::{Connection, EVENT_BUFFER, EndReason, Event, Parts, Timing, TrafficMeter};
-use super::rights::DayRight;
+use super::rights::{DayRight, SlotLease};
 use super::session::Session;
 use super::store::Store;
 use super::{ClientError, ControlPlaneClient, TunnelSettings};
@@ -39,7 +39,8 @@ pub(super) struct OnRight {
     pub(super) tunnel: TunnelSettings,
     pub(super) admitting: ControlPlaneClient,
     pub(super) identity: Arc<Identity>,
-    pub(super) slot: u8,
+    /// The slot it is on, held while it lives.
+    pub(super) lease: SlotLease,
     pub(super) window: Epoch,
     pub(super) day: DayRight,
 }
@@ -52,7 +53,8 @@ struct Pinger<R, S, M> {
     /// The Control Plane pings go to, until one fails to show a majority.
     current: ControlPlaneClient,
     identity: Arc<Identity>,
-    slot: u8,
+    /// The slot it is on: given back when the task ends.
+    lease: SlotLease,
     window: Epoch,
     day: DayRight,
     /// When the day's seconds began: the session's opening, or midnight.
@@ -77,7 +79,7 @@ pub(super) fn start<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter>(
         tunnel,
         admitting,
         identity,
-        slot,
+        lease,
         window,
         day,
     } = opened;
@@ -88,7 +90,7 @@ pub(super) fn start<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter>(
         admitting,
         session,
         identity,
-        slot,
+        lease,
         window,
         day,
         counting_from: Instant::now(),
@@ -167,7 +169,7 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Pinger<R, S, M> {
         }
         let day = self
             .singula
-            .day_right(&self.identity, self.slot, today)
+            .day_right(&self.identity, self.lease.slot(), today)
             .await?;
         let start = self
             .singula
@@ -273,8 +275,11 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Pinger<R, S, M> {
                 .await;
         }
         if reason == EndReason::ClosedByNetwork(CloseReason::Overlap) {
-            self.singula.slot_busy(self.slot, self.window).await;
+            self.singula.slot_busy(self.lease.slot(), self.window).await;
         }
+        // The slot is free before the application hears of the end: one that
+        // reconnects at once must find it free.
+        drop(self.lease);
         let _ = self.events.try_send(Event::Ended(reason));
     }
 

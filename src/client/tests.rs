@@ -1105,3 +1105,105 @@ mod journal {
         );
     }
 }
+
+/// Every long-running call can be spawned on a multi-threaded runtime, as an
+/// application keeping a session in the background does.
+#[tokio::test]
+async fn connections_and_calls_can_be_spawned() {
+    fn send<T: Send>(_: &T) {}
+    let wallet = LocalWallet::random();
+    let (_, singula) = singula(&wallet).await;
+    send(&singula.connect(&wallet, super::ConnectOptions::new(), Traffic::default));
+    send(&singula.choose_control_plane());
+    send(&singula.identities(&wallet));
+    let (_, cp, chain) = setup(wallet.address()).await;
+    let auth = WalletAuth::sign(&wallet, CP).await.expect("signs");
+    send(&cp.open_session(&chain, SessionRequest::wallet(auth)));
+}
+
+#[tokio::test]
+async fn each_of_a_clients_sessions_takes_its_own_slot() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula_with_slots(&wallet, 2).await;
+    let options = || {
+        super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick())
+    };
+
+    // Two hops of a route, say: two slots, two rights.
+    let first = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects");
+    let second = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects on the other slot");
+    assert_eq!(cp_state.state().journal.rights.len(), 2, "a right per slot");
+
+    // A third has no slot to go on, rather than opening one to be closed.
+    let third = singula.connect(&wallet, options(), Traffic::default).await;
+    assert!(matches!(third, Err(ClientError::NoFreeSlot)), "{third:?}");
+
+    // A slot given back is taken again.
+    first.close().await;
+    let again = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects on the slot given back");
+    assert_eq!(
+        cp_state.state().journal.rights.len(),
+        2,
+        "no new right: the day's is kept"
+    );
+    again.close().await;
+    second.close().await;
+}
+
+#[tokio::test]
+async fn a_slot_is_free_again_when_its_session_ends_or_its_opening_is_dropped() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula(&wallet).await;
+    let options = || {
+        super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick())
+    };
+
+    // An opening cancelled midway gives its slot back.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(1),
+        singula.connect(&wallet, options(), Traffic::default),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the opening was still running");
+    let mut conn = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("the one slot is free again");
+
+    // The network closes the session: the slot is free by the time the
+    // application hears of it, so reconnecting at once works.
+    cp_state
+        .state()
+        .journal
+        .statuses
+        .insert(conn.id().to_string(), (2, "idle".into()));
+    let ended = async {
+        while let Some(event) = conn.next_event().await {
+            if let super::Event::Ended(reason) = event {
+                return reason;
+            }
+        }
+        panic!("the connection stopped without ending");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), ended)
+        .await
+        .expect("in time");
+    let again = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("reconnects at once on the slot given back");
+    again.close().await;
+}

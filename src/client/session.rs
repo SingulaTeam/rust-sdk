@@ -331,7 +331,7 @@ impl ControlPlaneClient {
     async fn ask(
         &self,
         admission: &Admission,
-        session_request: &dyn Fn(Option<wire::LedgerAccess>) -> wire::SessionRequest,
+        session_request: &(dyn Fn(Option<wire::LedgerAccess>) -> wire::SessionRequest + Sync),
         keypair: &SessionKeypair,
         id: &RequestId,
         auth: Option<&WalletAuth>,

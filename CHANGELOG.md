@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-20
+
+### Fixed
+
+- `Singula::connect` keeps each of a client's sessions on a slot of its own:
+  a slot holds one session at a time, and a second one on it — another hop
+  of a route, say — would be closed as an overlap. With every slot taken it
+  returns the new `ClientError::NoFreeSlot` instead of opening a session to
+  be closed. A route of several hops needs as many slots. The slot is given
+  back when the session ends — before `Event::Ended` arrives, so reconnecting
+  at once finds it free — when it fails to open, and when the call opening
+  it is cancelled.
+
+- `Singula::connect` and `ControlPlaneClient::open_session` return `Send`
+  futures again, so a session can be opened from a spawned task. Opening on a
+  right held a non-`Sync` reference across an await.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added
@@ -171,6 +188,7 @@ The first release: the whole client side of the protocol.
 - `Subscription::starts_at`: subscriptions stack, and one activated while
   another still runs starts where it ends.
 
-[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/SingulaTeam/rust-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SingulaTeam/rust-sdk/releases/tag/v0.1.0
