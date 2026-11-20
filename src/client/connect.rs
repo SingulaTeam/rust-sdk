@@ -2,10 +2,10 @@
 //!
 //! [`Singula`] holds what every call needs — the chain, the prover, the
 //! store — and runs the protocol's steps in the order they must happen:
-//! identity before proof, packet before permission, a hold written down
-//! before it is used. [`Singula::connect`] ends with a running
-//! [`Connection`]: tunnel settings to hand to the engine, and a task that
-//! reports traffic and renews the session until it is closed.
+//! identity before proof, the day's right before the session it opens.
+//! [`Singula::connect`] ends with a running [`Connection`]: tunnel settings
+//! to hand to the engine, and a task that keeps the session — by pings on a
+//! right, by reports and renewals for a wallet — until it is closed.
 //!
 //! Everything here is built from the calls in [`ControlPlaneClient`] and
 //! [`Chain`]; use those directly where this does not fit.
@@ -18,43 +18,21 @@ use tokio::task::JoinSet;
 
 use super::connection::{Connection, Keeper, Opened, Timing, TrafficMeter};
 use super::governance::{GovernanceAction, Participant};
-use super::ledger::{Lease, Ledger, SLOT_STRIDE};
-use super::proto::client::ErrorCode;
+use super::pinger::{self, OnRight};
+use super::records::Records;
 use super::relay::{Activated, MAX_SLOTS, Minted};
-use super::session::SessionRequest;
+use super::rights::JournalState;
+use super::session::{NotOpened, SessionRequest};
 use super::store::Store;
 use super::time::{SystemTime, TimeSource};
 use super::wallet::{PersonalMessage, Wallet, sign_message_checked};
 use super::{ClientError, ControlPlaneClient, Country, TunnelSettings, WalletAuth};
 use crate::chain::{Chain, Payment, Rpc, TokenId, TxHash};
-use crate::id::{Epoch, StarId, UnixTime};
-use crate::zk::{AccessProof, Claim, Identity, Prover};
+use crate::id::{StarId, UnixTime};
+use crate::zk::{Identity, Prover};
 
 /// How long a Control Plane has to answer when one is being chosen.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long Control Planes keep a permission after its session ends: one
-/// lease (a minute) past the last renewal heard, with room for the
-/// federation's gossip to arrive late.
-const HELD_AFTER_END: Duration = Duration::from_secs(90);
-
-/// How long Control Planes keep a session nobody reports on: five minutes
-/// without a checkpoint, up to two more until the next sweep, and the lease
-/// after that. A client that died holding a permission takes it back then.
-const KEPT_WITHOUT_REPORTS: Duration = Duration::from_secs(8 * 60);
-
-/// How many of a client's permissions may be waiting out a Control Plane's
-/// hold before it waits too, rather than take another index.
-///
-/// One: a session that failed is usually retried at once, on another node,
-/// and waiting out the hold on its permission would stall that by a minute
-/// and a half. A second failure in a row waits, so a client spends at most
-/// its running sessions and two more of the subscription's indices.
-const COOLING_BEFORE_WAIT: usize = 2;
-
-/// How many quota slots in a row may turn out used by the subscription's
-/// other devices before a connect gives up: the most a Control Plane allows.
-const MAX_CLAIMS_USED: u32 = 50;
 
 /// A subscriber's identities in the set, one per registered slot, each with
 /// its slot number. Never empty.
@@ -64,7 +42,7 @@ pub(super) type Identities = Arc<[(u8, Arc<Identity>)]>;
 ///
 /// Cheap to clone; clones share everything.
 pub struct Singula<R, S> {
-    inner: Arc<Inner<R, S>>,
+    pub(super) inner: Arc<Inner<R, S>>,
 }
 
 pub(super) struct Inner<R, S> {
@@ -75,6 +53,8 @@ pub(super) struct Inner<R, S> {
     /// rather than the one they published.
     pinned: Mutex<HashMap<StarId, ControlPlaneClient>>,
     time: Mutex<Arc<dyn TimeSource>>,
+    /// The journal's reads from the chain, and the day's rights.
+    pub(super) journal: tokio::sync::Mutex<JournalState>,
 }
 
 impl<R, S> Clone for Singula<R, S> {
@@ -89,8 +69,8 @@ impl<R, S> Clone for Singula<R, S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Access {
-    /// By a membership proof and a permission. The Control Plane learns that
-    /// some subscriber connected, and nothing else.
+    /// By the day's right of one of the subscription's slots. The Control
+    /// Plane learns that some paid slot connected today, and nothing else.
     #[default]
     Anonymous,
     /// By the wallet's sign-in. The Control Plane knows whose session it is.
@@ -153,10 +133,27 @@ impl ConnectOptions {
         self
     }
 
-    /// Report and renew on another schedule than the default.
+    /// Ping, report and renew on another schedule than the default.
     pub fn timing(mut self, timing: Timing) -> Self {
         self.timing = timing;
         self
+    }
+
+    /// `request`, asking for the node, country, cover and leg chosen here.
+    fn shape(&self, mut request: SessionRequest) -> SessionRequest {
+        if let Some(node) = self.node {
+            request = request.node(node);
+        }
+        if let Some(country) = self.country {
+            request = request.country(country);
+        }
+        if let Some(cover) = self.cover.clone() {
+            request = request.cover(cover);
+        }
+        if self.exit_leg {
+            request = request.exit_leg();
+        }
+        request
     }
 }
 
@@ -170,6 +167,7 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
                 store,
                 pinned: Mutex::new(HashMap::new()),
                 time: Mutex::new(Arc::new(SystemTime)),
+                journal: tokio::sync::Mutex::new(JournalState::default()),
             }),
         }
     }
@@ -238,22 +236,8 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
     ///
     /// Returns [`ClientError::NoControlPlane`] if none answers in time.
     pub async fn choose_control_plane(&self) -> Result<ControlPlaneClient, ClientError> {
-        let mut candidates: Vec<ControlPlaneClient> = self
-            .inner
-            .pinned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        for cp in self.inner.chain.control_planes().await? {
-            if !candidates.iter().any(|c| c.star() == cp.star) {
-                // An endpoint that does not form a URL is skipped, not fatal.
-                candidates.extend(ControlPlaneClient::new(&cp));
-            }
-        }
         let mut probes = JoinSet::new();
-        for cp in candidates {
+        for cp in self.control_planes().await? {
             probes.spawn(async move {
                 let answer = tokio::time::timeout(HEALTH_TIMEOUT, cp.health()).await;
                 matches!(answer, Ok(Ok(h)) if h.healthy).then_some(cp)
@@ -268,6 +252,39 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         Err(ClientError::NoControlPlane)
     }
 
+    /// Every Control Plane: those pinned to an address of the application's
+    /// choosing, and every other the chain lists, in random order. The
+    /// pinned ones are there even when the chain cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Chain`] if the list cannot be read and none is
+    /// pinned.
+    pub(super) async fn control_planes(&self) -> Result<Vec<ControlPlaneClient>, ClientError> {
+        let mut out: Vec<ControlPlaneClient> = self
+            .inner
+            .pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        match self.inner.chain.control_planes().await {
+            Ok(listed) => {
+                for cp in listed {
+                    if !out.iter().any(|c| c.star() == cp.star) {
+                        // An endpoint that does not form a URL is skipped, not fatal.
+                        out.extend(ControlPlaneClient::new(&cp));
+                    }
+                }
+            }
+            Err(e) if out.is_empty() => return Err(e.into()),
+            Err(_) => {}
+        }
+        shuffle(&mut out);
+        Ok(out)
+    }
+
     /// The wallet's anonymous identity: the one it derived before, or a new
     /// derivation, which asks the wallet to sign once and is then kept.
     ///
@@ -275,15 +292,15 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
     ///
     /// Returns [`ClientError`] if the wallet does not sign or the store fails.
     pub async fn identity<W: Wallet>(&self, wallet: &W) -> Result<Arc<Identity>, ClientError> {
-        let ledger = Ledger(&self.inner.store);
-        if let Some(identity) = ledger.identity(wallet.address()).await? {
+        let records = Records(&self.inner.store);
+        if let Some(identity) = records.identity(wallet.address()).await? {
             return Ok(Arc::new(identity));
         }
         let signature =
             sign_message_checked(wallet, PersonalMessage::Text(Identity::SIGNING_MESSAGE)).await?;
         // The text the wallet returns, as the JavaScript client passes it on.
         let identity = Identity::from_signature(&format!("0x{}", crate::hex::lower(&signature.0)));
-        ledger.keep_identity(wallet.address(), &identity).await?;
+        records.keep_identity(wallet.address(), &identity).await?;
         Ok(Arc::new(identity))
     }
 
@@ -325,12 +342,12 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         wallet: &W,
         cp: StarId,
     ) -> Result<WalletAuth, ClientError> {
-        let ledger = Ledger(&self.inner.store);
-        if let Some(auth) = ledger.sign_in(cp, wallet.address()).await? {
+        let records = Records(&self.inner.store);
+        if let Some(auth) = records.sign_in(cp, wallet.address()).await? {
             return Ok(auth);
         }
         let auth = WalletAuth::sign(wallet, cp).await?;
-        ledger.keep_sign_in(&auth).await?;
+        records.keep_sign_in(&auth).await?;
         Ok(auth)
     }
 
@@ -446,17 +463,16 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
             .await
     }
 
-    /// Opens a session and keeps it: reports its traffic, as `meter` counts
-    /// it, and renews it, until the returned [`Connection`] is closed.
+    /// Opens a session and keeps it until the returned [`Connection`] is
+    /// closed: by pings on the day's right, with the traffic `meter` counts,
+    /// or — for a wallet's session — by reports and renewals.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::NotRegistered`] if anonymous access is asked
-    /// for by an identity not in the set, [`ClientError::NoPermissionFree`]
-    /// if every permission of the window is held, [`ClientError::NodeAnswer`]
-    /// if the node's answer does not check out, and any error of the steps
-    /// along the way. A permission leased for a session that did not open is
-    /// given back, unless the Control Plane took it first.
+    /// for and none of the wallet's slots is a member for the whole day,
+    /// [`ClientError::NodeAnswer`] if the node's answer does not check out,
+    /// and any error of the steps along the way.
     pub async fn connect<W: Wallet, M: TrafficMeter>(
         &self,
         wallet: &W,
@@ -467,80 +483,31 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
             Some(star) => self.control_plane(star).await?,
             None => self.choose_control_plane().await?,
         };
-        let ledger = Ledger(&self.inner.store);
-        let mut claims_used = 0;
-        let (session, held) = loop {
-            let (admission, held) = match options.access {
-                Access::Wallet => (
-                    SessionRequest::wallet(self.sign_in(wallet, cp.star()).await?),
-                    None,
-                ),
-                Access::Anonymous => {
-                    let identities = self.identities(wallet).await?;
-                    let (proof, lease) = self.admit(&cp, &identities).await?;
-                    (
-                        SessionRequest::anonymous(proof, lease.permission.clone()),
-                        Some((lease, identities)),
-                    )
-                }
-            };
-            let mut request = admission;
-            if let Some(node) = options.node {
-                request = request.node(node);
-            }
-            if let Some(country) = options.country {
-                request = request.country(country);
-            }
-            if let Some(cover) = options.cover.clone() {
-                request = request.cover(cover);
-            }
-            if options.exit_leg {
-                request = request.exit_leg();
-            }
-
-            let failed = match cp.open(&self.inner.chain, request).await {
-                Ok(session) => break (session, held),
-                Err(failed) => failed,
-            };
-            if let Some((lease, _)) = &held {
-                if claim_used(&failed.error) && claims_used < MAX_CLAIMS_USED {
-                    // Another of the subscription's devices used this quota
-                    // slot at this Control Plane; it counts its own. The
-                    // permission was not spent — the proof is checked first —
-                    // and the next slot is proved with it.
-                    claims_used += 1;
-                    ledger.release(lease).await?;
-                    continue;
-                }
-                if failed.admitted || spent(&failed.error) {
-                    // The Control Plane took the permission — for a
-                    // session this client refused and has ended, or one
-                    // it still holds — and frees it within a lease.
-                    ledger.release_at(lease, self.held_until()).await?;
-                } else {
-                    ledger.release(lease).await?;
-                }
-            }
-            return Err(match failed.node {
-                Some(node) if failed.admitted => ClientError::NodeAnswer {
-                    node,
-                    error: Box::new(failed.error),
-                },
-                _ => failed.error,
-            });
-        };
-        if let Some((lease, _)) = &held {
-            ledger.bind(lease, session.id(), self.kept_until()).await?;
+        match options.access {
+            Access::Wallet => self.connect_wallet(wallet, cp, &options, meter).await,
+            Access::Anonymous => self.connect_on_right(wallet, cp, &options, meter).await,
         }
+    }
+
+    /// A wallet's session, kept by reports and renewals.
+    async fn connect_wallet<W: Wallet, M: TrafficMeter>(
+        &self,
+        wallet: &W,
+        cp: ControlPlaneClient,
+        options: &ConnectOptions,
+        meter: M,
+    ) -> Result<Connection, ClientError> {
+        let auth = self.sign_in(wallet, cp.star()).await?;
+        let request = options.shape(SessionRequest::wallet(auth.clone()));
+        let session = cp
+            .open(&self.inner.chain, request)
+            .await
+            .map_err(not_opened)?;
         let tunnel = TunnelSettings::decode(session.credentials())?;
         let reporter = if session.report_to() == cp.star() {
             cp.clone()
         } else {
             self.control_plane(session.report_to()).await?
-        };
-        let auth = match options.access {
-            Access::Wallet => Some(self.sign_in(wallet, cp.star()).await?),
-            Access::Anonymous => None,
         };
         let opened = Opened {
             session,
@@ -548,163 +515,49 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
             admitting: cp,
             reporter,
             auth,
-            held,
         };
         Ok(Keeper::start(self.clone(), opened, meter, options.timing))
     }
 
-    /// A session proof and a permission for one session at `cp`: one held,
-    /// or one taken now.
-    ///
-    /// The proof is made by the identity whose permission it is, when that
-    /// one is still in the set; a permission is not tied to an identity, so
-    /// one held from an Orbit since replaced is proved for by any of them.
-    async fn admit(
+    /// A session on the day's right of one of the wallet's slots, kept by
+    /// pings. Slots another device was found on today are tried last.
+    async fn connect_on_right<W: Wallet, M: TrafficMeter>(
         &self,
-        cp: &ControlPlaneClient,
-        identities: &Identities,
-    ) -> Result<(AccessProof, Lease), ClientError> {
-        let epoch = self.current_epoch()?;
-        let lease = self.lease(cp, identities, epoch).await?;
-        let identity = identities
-            .iter()
-            .find(|(slot, _)| *slot == lease.slot)
-            .unwrap_or(&identities[0])
-            .1
-            .clone();
-        let slot = Ledger(&self.inner.store).take_slot(cp.star(), epoch).await;
-        let slot = match slot {
-            Ok(slot) => slot,
-            Err(e) => {
-                Ledger(&self.inner.store).release(&lease).await?;
-                return Err(e.into());
-            }
-        };
-        let claim = Claim::Session {
-            control_plane: cp.star(),
-            epoch,
-            index: slot,
-        };
-        match self.prove(&identity, claim).await {
-            Ok(proof) => Ok((proof, lease)),
-            Err(e) => {
-                Ledger(&self.inner.store).release(&lease).await?;
-                Err(e)
-            }
-        }
-    }
-
-    /// A free permission of `window`: one this client holds, or one taken
-    /// now from `cp` by one of `identities`, under an index nobody has taken
-    /// yet. Each identity has its own indices, one per permission the issuer
-    /// grants it a window.
-    ///
-    /// A new index is taken only while few permissions held here are waiting
-    /// out a hold (see [`COOLING_BEFORE_WAIT`]). One whose session ended
-    /// frees again within a minute and a half, and waiting for it keeps the
-    /// subscription's other indices for its other devices: taking a new one
-    /// on every reconnect would spend them all on one.
-    pub(super) async fn lease(
-        &self,
-        cp: &ControlPlaneClient,
-        identities: &Identities,
-        window: Epoch,
-    ) -> Result<Lease, ClientError> {
-        let ledger = Ledger(&self.inner.store);
-        if let Some(lease) = ledger.lease(window, self.now(), self.kept_until()).await? {
-            return Ok(lease);
-        }
-        let cooling = ledger.cooling(window, self.now()).await?;
-        let wait = || {
-            cooling.first().map_or(ClientError::NoPermissionFree, |at| {
-                ClientError::PermissionFreeAt(UnixTime(*at))
-            })
-        };
-        if cooling.len() >= COOLING_BEFORE_WAIT {
-            return Err(wait());
-        }
-        let key = cp.issuer_key(&self.inner.chain).await?;
-        if key.window() != window {
-            return Err(ClientError::Mismatch(
-                "the issuer signs for another window than the current one",
-            ));
-        }
-        // In random order, so devices starting at once rarely race for the
-        // same index and spend a proof on a refusal.
-        let candidates: Vec<u32> = identities
-            .iter()
-            .flat_map(|(slot, _)| {
-                (0..key.packet_size()).map(move |index| u32::from(*slot) * SLOT_STRIDE + index)
-            })
-            .collect();
-        let mut untried = ledger.untried(window, &candidates).await?;
-        shuffle(&mut untried);
-        for held in untried {
-            let (slot, index) = (held / SLOT_STRIDE, held % SLOT_STRIDE);
-            let Some((_, identity)) = identities.iter().find(|(s, _)| u32::from(*s) == slot) else {
-                continue;
-            };
-            let proof = self
-                .prove(identity, Claim::Permission { window, index })
-                .await?;
-            match cp.take_permission(&key, index, &proof).await {
-                Ok(permission) => {
-                    ledger.add(held, &permission).await?;
-                    return ledger
-                        .lease(window, self.now(), self.kept_until())
-                        .await?
-                        .ok_or(ClientError::NoPermissionFree);
-                }
-                Err(ClientError::PermissionTaken(_)) => {
-                    ledger.taken_elsewhere(window, held).await?;
-                }
+        wallet: &W,
+        cp: ControlPlaneClient,
+        options: &ConnectOptions,
+        meter: M,
+    ) -> Result<Connection, ClientError> {
+        let identities = self.identities(wallet).await?;
+        let window = self
+            .window_at(self.now(), Duration::ZERO)
+            .ok_or(ClientError::Mismatch("the protocol has not started"))?;
+        for (slot, identity) in self.slot_order(&identities, window).await.iter() {
+            let day = match self.day_right(identity, *slot, window).await {
+                Ok(day) => day,
+                // Its Orbit ends during the day: another slot may not.
+                Err(ClientError::NotRegistered) => continue,
                 Err(e) => return Err(e),
-            }
+            };
+            let params = self.inner.chain.journal_params();
+            let request = SessionRequest::on_right(day.right.clone(), Arc::clone(&day.key), params);
+            let session = cp
+                .open(&self.inner.chain, options.shape(request))
+                .await
+                .map_err(not_opened)?;
+            let tunnel = TunnelSettings::decode(session.credentials())?;
+            let opened = OnRight {
+                session,
+                tunnel,
+                admitting: cp,
+                identity: Arc::clone(identity),
+                slot: *slot,
+                window,
+                day,
+            };
+            return Ok(pinger::start(self.clone(), opened, meter, options.timing));
         }
-        Err(wait())
-    }
-
-    /// Proves membership for `claim` on the blocking pool, against the set
-    /// as the chain holds it now.
-    pub(super) async fn prove(
-        &self,
-        identity: &Arc<Identity>,
-        claim: Claim,
-    ) -> Result<AccessProof, ClientError> {
-        let group = self.inner.chain.subscriber_group().await?;
-        if group.index_of(identity.commitment()).is_none() {
-            return Err(ClientError::NotRegistered);
-        }
-        let this = self.clone();
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || this.inner.prover.prove(&identity, &group, claim))
-            .await
-            .map_err(|_| ClientError::Malformed("the prover stopped"))?
-            .map_err(ClientError::from)
-    }
-
-    pub(super) fn current_epoch(&self) -> Result<Epoch, ClientError> {
-        self.inner
-            .chain
-            .deployment()
-            .clock
-            .epoch_at(self.now())
-            .ok_or(ClientError::Mismatch("the protocol has not started"))
-    }
-
-    /// How long a permission stays held by a session that is never reported
-    /// on again: until its Control Plane has swept the silent session.
-    pub(super) fn kept_until(&self) -> UnixTime {
-        UnixTime(self.now().0 + i64::try_from(KEPT_WITHOUT_REPORTS.as_secs()).unwrap_or(i64::MAX))
-    }
-
-    /// When a permission whose session ends now is free again everywhere.
-    pub(super) fn held_until(&self) -> UnixTime {
-        UnixTime(self.now().0 + i64::try_from(HELD_AFTER_END.as_secs()).unwrap_or(i64::MAX))
-    }
-
-    pub(super) fn ledger(&self) -> Ledger<'_, S> {
-        Ledger(&self.inner.store)
+        Err(ClientError::NotRegistered)
     }
 
     fn pinned(&self, star: StarId) -> Option<ControlPlaneClient> {
@@ -723,18 +576,21 @@ impl<R, S> std::fmt::Debug for Singula<R, S> {
     }
 }
 
-/// Whether a Control Plane refused a session proof's quota slot as used.
-fn claim_used(e: &ClientError) -> bool {
-    matches!(e, ClientError::Refused { code, .. } if *code == ErrorCode::AccessClaimUsed as i32)
-}
-
-/// Whether a Control Plane refused a permission as held already.
-fn spent(e: &ClientError) -> bool {
-    matches!(e, ClientError::Refused { code, .. } if *code == ErrorCode::PermissionSpent as i32)
+/// The error a failed open stands for: the node's answer refused, when the
+/// Control Plane admitted the session and the node's answer did not check
+/// out.
+fn not_opened(failed: NotOpened) -> ClientError {
+    match failed.node {
+        Some(node) if failed.admitted => ClientError::NodeAnswer {
+            node,
+            error: Box::new(failed.error),
+        },
+        _ => failed.error,
+    }
 }
 
 /// Puts `items` in a uniformly random order (Fisher–Yates).
-fn shuffle(items: &mut [u32]) {
+fn shuffle<T>(items: &mut [T]) {
     use rand_core::{OsRng, RngCore as _};
     for i in (1..items.len()).rev() {
         let j = usize::try_from(OsRng.next_u64() % (i as u64 + 1)).unwrap_or(0);

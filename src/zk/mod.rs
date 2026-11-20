@@ -1,11 +1,11 @@
 //! Anonymous access with Semaphore.
 //!
 //! A subscriber is admitted without saying which subscriber they are. Each
-//! holds an [`Identity`] whose commitment sits in the subscription registry;
-//! to open a session they prove, in zero knowledge, that their commitment is
-//! in the registry's [`Group`] — and nothing more. The proof carries a
-//! nullifier fixed by the [`Claim`], so the same subscriber cannot spend the
-//! same slot twice, yet two proofs by one subscriber cannot be linked.
+//! slot holds an [`Identity`] whose commitment sits in the subscription
+//! registry; to take the day's right they prove, in zero knowledge, that
+//! their commitment is in the day's [`Group`] — and nothing more. The proof
+//! carries a nullifier fixed by the [`Claim`], so one slot has one right a
+//! day, yet two days' rights by one subscriber cannot be linked.
 //!
 //! ```text
 //! wallet signature ──► Identity ──► commitment ─┐

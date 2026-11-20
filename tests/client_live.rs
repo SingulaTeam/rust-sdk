@@ -50,14 +50,13 @@ async fn lists_nodes_that_are_nodes_on_chain() {
 
 #[tokio::test]
 #[ignore = "needs the network and SINGULA_RPC_URL"]
-async fn the_issuer_key_matches_its_commitment() {
-    let (chain, cp) = setup().await;
-    let key = cp
-        .issuer_key(&chain)
-        .await
-        .expect("the key matches the on-chain commitment");
-    assert_eq!(key.issuer(), cp.star());
-    assert!(key.packet_size() > 0);
+async fn the_control_plane_knows_nothing_of_a_session_it_never_held() {
+    let (_, cp) = setup().await;
+    let id: singula::SessionId = "00000000-0000-4000-8000-000000000000"
+        .parse()
+        .expect("a session id");
+    let status = cp.session_status(&id).await.expect("answers");
+    assert_eq!(status, singula::journal::SessionStatus::Unknown);
 }
 
 #[tokio::test]

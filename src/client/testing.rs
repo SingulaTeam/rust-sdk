@@ -11,7 +11,6 @@ use aes_gcm::aead::{Aead as _, KeyInit as _};
 use aes_gcm::{Aes256Gcm, Nonce};
 use alloy_primitives::{Address as AlloyAddress, FixedBytes, U256};
 use alloy_sol_types::{Eip712Domain, SolCall as _, SolStruct as _};
-use blind_rsa_signatures::SecretKeySha384PSSRandomized;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use hkdf::Hkdf;
 use k256::ecdsa::SigningKey;
@@ -38,12 +37,15 @@ use crate::eth;
 use crate::id::{Address, RequestId, SessionId, StarId, UnixTime};
 use crate::sign_in::SignInMessage;
 
+mod journal;
+pub(super) use journal::{Acks, MockJournal};
+
 /// The Control Plane's Star id.
 pub(super) const CP: StarId = StarId(8);
 /// The node's.
 pub(super) const NODE: StarId = StarId(12);
 /// The window everything happens in: the current one, by the test
-/// network's clock, since the client checks the issuer's key against it.
+/// network's clock.
 pub(super) fn window() -> u64 {
     let clock = crate::chain::Clock {
         epoch_zero: UnixTime(1_780_417_577),
@@ -51,8 +53,6 @@ pub(super) fn window() -> u64 {
     };
     clock.current_epoch().map_or(0, |e| e.0)
 }
-/// Permissions per packet.
-pub(super) const PACKET_SIZE: u32 = 3;
 /// The address the node's tunnel settings name.
 pub(super) const NODE_ADDRESS: &str = "203.0.113.7";
 
@@ -65,25 +65,8 @@ pub(super) const CHAIN_ID: u64 = 421_614;
 /// What the transactions it relays are called.
 pub(super) const TX: &str = "0xabababababababababababababababababababababababababababababababab";
 
-/// The issuer's key pair for the tests: generated once per run, since a
-/// 2048-bit RSA key takes a moment, and never written anywhere.
-pub(super) fn issuer_key() -> &'static (Vec<u8>, SecretKeySha384PSSRandomized) {
-    static KEY: std::sync::OnceLock<(Vec<u8>, SecretKeySha384PSSRandomized)> =
-        std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        let pair = blind_rsa_signatures::KeyPairSha384PSSRandomized::generate(
-            &mut blind_rsa_signatures::DefaultRng,
-            2048,
-        )
-        .expect("a key pair");
-        (pair.pk.to_der().expect("encodes"), pair.sk)
-    })
-}
-
 /// What the Control Plane remembers, for tests to inspect.
 pub(super) struct State {
-    /// The window it issues for.
-    pub(super) window: u64,
     /// Its clock, when a test controls it.
     pub(super) clock: Option<ManualTime>,
     /// Whether it declines every renewal.
@@ -91,8 +74,6 @@ pub(super) struct State {
     /// Whether it relays credentials without the node's signature, as nodes
     /// from before the signature did.
     pub(super) unsigned_credentials: bool,
-    pub(super) issuer: SecretKeySha384PSSRandomized,
-    pub(super) issuer_der: Vec<u8>,
     pub(super) node_signer: SigningKey,
     sessions: HashMap<String, Held>,
     /// Sessions ended by their wallet.
@@ -105,28 +86,19 @@ pub(super) struct State {
     pub(super) joined: Vec<[u8; 32]>,
     /// Governance calls relayed, as the wallet signed them.
     pub(super) governed: Vec<Vec<u8>>,
-    /// Permissions signed.
-    pub(super) permissions_taken: usize,
-    /// Indices another device of the subscription took, by window; set by a
-    /// test. They stand for the test identity's.
-    pub(super) indices_taken: Vec<(u64, u32)>,
-    /// Nullifiers of the permissions it signed. Like a real Control Plane it
-    /// knows a permission was taken by its nullifier, which differs between
-    /// a subscriber's identities: each slot's identity has its own indices.
-    pub(super) nullifiers_taken: Vec<Vec<u8>>,
-    /// Quota slots another device used, refused as such.
-    pub(super) slots_used_elsewhere: Vec<u32>,
-    /// Quota slots presented with session requests, in order.
-    pub(super) slots_seen: Vec<u32>,
-    /// Permissions presented with session requests and renewals.
-    pub(super) permissions_seen: usize,
-    /// The prepared messages of permissions presented with session requests.
-    pub(super) permissions_presented: Vec<Vec<u8>>,
-    /// Whether it keeps holding a permission after its session is ended, as
-    /// a Control Plane does until its lease runs out.
-    pub(super) holds_after_end: bool,
     /// Sessions opened, for distinct ids.
     sessions_opened: u64,
+    /// The shared journal it keeps with its federation.
+    pub(super) journal: MockJournal,
+}
+
+/// What one stream has said so far.
+#[derive(Default)]
+struct Stream {
+    /// The wallet it signed in as.
+    wallet: Option<Address>,
+    /// The challenge it was issued for a session on a right.
+    challenge: Option<[u8; 32]>,
 }
 
 /// A clock a test moves by hand.
@@ -162,8 +134,6 @@ struct Held {
     checkpoint_key: VerifyingKey,
     nonce: Vec<u8>,
     wallet: Option<Address>,
-    /// The permission it was admitted on, held until it ends.
-    permission: Option<Vec<u8>>,
 }
 
 /// A running Control Plane.
@@ -171,10 +141,8 @@ struct Held {
 pub(super) struct MockCp(Arc<Mutex<State>>);
 
 impl MockCp {
-    pub(super) fn new(issuer_der: Vec<u8>, issuer: SecretKeySha384PSSRandomized) -> Self {
+    pub(super) fn new() -> Self {
         Self(Arc::new(Mutex::new(State {
-            issuer,
-            issuer_der,
             node_signer: eth::random_key(),
             sessions: HashMap::new(),
             ended: Vec::new(),
@@ -182,19 +150,11 @@ impl MockCp {
             mint_ceilings: Vec::new(),
             joined: Vec::new(),
             governed: Vec::new(),
-            permissions_taken: 0,
-            indices_taken: Vec::new(),
-            nullifiers_taken: Vec::new(),
-            slots_used_elsewhere: Vec::new(),
-            slots_seen: Vec::new(),
-            permissions_seen: 0,
-            permissions_presented: Vec::new(),
-            holds_after_end: false,
             sessions_opened: 0,
-            window: window(),
             clock: None,
             refuse_renewals: false,
             unsigned_credentials: false,
+            journal: MockJournal::new(),
         })))
     }
 
@@ -204,8 +164,14 @@ impl MockCp {
 
     /// Serves on a local port and returns a client for it.
     pub(super) async fn serve(&self) -> ControlPlaneClient {
+        self.serve_as(CP).await
+    }
+
+    /// Serves on a local port and returns a client that knows it as `star`.
+    pub(super) async fn serve_as(&self, star: StarId) -> ControlPlaneClient {
         let port = self.listen().await;
-        ControlPlaneClient::with_url(CP, &format!("http://127.0.0.1:{port}")).expect("a local URL")
+        ControlPlaneClient::with_url(star, &format!("http://127.0.0.1:{port}"))
+            .expect("a local URL")
     }
 
     /// Serves plain HTTP/2 on a local port, as a front forwards it, and
@@ -236,11 +202,10 @@ impl ClientService for MockCp {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let cp = self.clone();
         tokio::spawn(async move {
-            // The wallet this stream signed in as.
-            let mut wallet = None;
+            let mut stream = Stream::default();
             while let Ok(Some(msg)) = inbound.message().await {
                 let Some(msg) = msg.message else { continue };
-                let replies = cp.handle(&mut wallet, msg);
+                let replies = cp.handle(&mut stream, msg);
                 for message in replies {
                     if tx
                         .send(Ok(ControlPlaneMessage {
@@ -281,7 +246,8 @@ fn refuse(request_id: &str, why: &str) -> Vec<Out> {
 }
 
 impl MockCp {
-    fn handle(&self, wallet: &mut Option<Address>, msg: In) -> Vec<Out> {
+    fn handle(&self, stream: &mut Stream, msg: In) -> Vec<Out> {
+        let wallet = &mut stream.wallet;
         match msg {
             In::Auth(a) => Self::auth(wallet, &a),
             In::ListNodes(r) => vec![Out::ListNodesResult(wire::ListNodesResult {
@@ -307,21 +273,46 @@ impl MockCp {
                 price_usdc_wei: "10000000000000000000".into(),
                 ..Default::default()
             })],
-            In::GetIssuerKey(r) => {
-                // One lock for both fields: the state's mutex is not reentrant.
+            In::GetIssuerKey(r) => refuse(&r.request_id, "permissions are gone"),
+            In::TakePacket(r) => refuse(&r.request_id, "permissions are gone"),
+            In::SessionRequest(r) => {
+                let challenge = stream.challenge.take();
+                self.open(stream.wallet, challenge, r)
+            }
+            In::LedgerChallenge(r) => {
+                let mut challenge = [0u8; 32];
+                OsRng.fill_bytes(&mut challenge);
+                stream.challenge = Some(challenge);
                 let s = self.state();
-                vec![Out::GetIssuerKeyResult(wire::GetIssuerKeyResult {
+                vec![Out::LedgerChallenge(wire::LedgerChallenge {
                     request_id: r.request_id,
-                    success: true,
-                    issuer_star_id: CP.0,
-                    window: s.window,
-                    issuer_public_key: s.issuer_der.clone(),
-                    packet_size: PACKET_SIZE,
-                    ..Default::default()
+                    challenge: challenge.to_vec(),
+                    expires_at: s.now().0 + 60,
+                    cp_star_id: s.journal.challenge_names.0,
                 })]
             }
-            In::TakePacket(r) => self.take_packet(r),
-            In::SessionRequest(r) => self.open(*wallet, r),
+            In::LedgerPing(r) => {
+                let mut s = self.state();
+                let now = s.now();
+                vec![Out::LedgerAck(s.journal.ping(&r, now))]
+            }
+            In::LedgerSessionStatus(r) => {
+                let s = self.state();
+                let (state, reason) = s
+                    .journal
+                    .statuses
+                    .get(&r.session_uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                vec![Out::LedgerSessionStatus(wire::LedgerSessionStatus {
+                    request_id: r.request_id,
+                    session_uuid: r.session_uuid,
+                    state,
+                    reason,
+                    total: 0,
+                    last: 0,
+                })]
+            }
             In::TrafficCheckpoint(c) => self.checkpoint(&c),
             In::RenewSession(r) => self.renew(r),
             In::SessionEnd(e) if !e.signature.is_empty() => self.end_signed(&e),
@@ -378,49 +369,19 @@ impl MockCp {
         })]
     }
 
-    fn take_packet(&self, r: wire::TakePacketRequest) -> Vec<Out> {
-        let access = r.access.unwrap_or_default();
-        if access.points.len() != 8 || r.blinded.len() != 1 || r.index >= PACKET_SIZE {
-            return refuse(&r.request_id, "malformed permission request");
+    fn open(
+        &self,
+        wallet: Option<Address>,
+        challenge: Option<[u8; 32]>,
+        r: wire::SessionRequest,
+    ) -> Vec<Out> {
+        if let Some(Err(why)) = r.ledger.as_ref().map(|l| {
+            let mut s = self.state();
+            s.journal.admit(challenge, l, &r.session_public_key)
+        }) {
+            return refuse(&r.request_id, why);
         }
-        let mut s = self.state();
-        let taken = (s.window, r.index);
-        if s.indices_taken.contains(&taken) || s.nullifiers_taken.contains(&access.nullifier) {
-            return vec![Out::TakePacketResult(wire::TakePacketResult {
-                request_id: r.request_id,
-                success: false,
-                error_message: "this permission is already taken".into(),
-                index_taken: true,
-                ..Default::default()
-            })];
-        }
-        s.nullifiers_taken.push(access.nullifier.clone());
-        s.permissions_taken += 1;
-        let signatures: Option<Vec<Vec<u8>>> = r
-            .blinded
-            .iter()
-            .map(|b| s.issuer.blind_sign(b).ok().map(|sig| sig.0))
-            .collect();
-        let Some(blind_signatures) = signatures else {
-            return refuse(&r.request_id, "cannot sign");
-        };
-        vec![Out::TakePacketResult(wire::TakePacketResult {
-            request_id: r.request_id,
-            success: true,
-            blind_signatures,
-            issuer_star_id: CP.0,
-            issuer_public_key: s.issuer_der.clone(),
-            window: s.window,
-            ..Default::default()
-        })]
-    }
-
-    fn open(&self, wallet: Option<Address>, r: wire::SessionRequest) -> Vec<Out> {
-        let anonymous = r.access.is_some();
-        if anonymous && r.permission.is_none() {
-            return refuse(&r.request_id, "a permission is required");
-        }
-        if !anonymous && wallet.is_none() {
+        if r.ledger.is_none() && wallet.is_none() {
             return refuse(&r.request_id, "not authenticated");
         }
         let Ok(client_key) = <[u8; 32]>::try_from(r.session_public_key.as_slice()) else {
@@ -438,31 +399,6 @@ impl MockCp {
         let session: SessionId = format!("8f14e45f-ceea-467f-a8d5-{:012x}", s.sessions_opened)
             .parse()
             .expect("a session id");
-        if let Some(access) = &r.access {
-            if s.slots_used_elsewhere.contains(&access.index) {
-                return vec![Out::Error(wire::Error {
-                    code: wire::ErrorCode::AccessClaimUsed.into(),
-                    message: "this access claim has already been used".into(),
-                    request_id: r.request_id,
-                })];
-            }
-            s.slots_seen.push(access.index);
-        }
-        s.permissions_seen += usize::from(r.permission.is_some());
-        if let Some(p) = &r.permission {
-            let held = s
-                .sessions
-                .values()
-                .any(|h| h.permission.as_ref() == Some(&p.prepared_message));
-            if held {
-                return vec![Out::Error(wire::Error {
-                    code: wire::ErrorCode::PermissionSpent.into(),
-                    message: "this permission has already been spent".into(),
-                    request_id: r.request_id,
-                })];
-            }
-            s.permissions_presented.push(p.prepared_message.clone());
-        }
         let credentials = VlessCredentials {
             uuid: session.to_string(),
             address: NODE_ADDRESS.into(),
@@ -489,7 +425,6 @@ impl MockCp {
                 checkpoint_key,
                 nonce: challenge.clone(),
                 wallet,
-                permission: r.permission.as_ref().map(|p| p.prepared_message.clone()),
             },
         );
         vec![Out::SessionCredentials(wire::SessionCredentials {
@@ -511,8 +446,7 @@ impl MockCp {
         })]
     }
 
-    /// An end signed by the session's key: the session ends, and with it
-    /// the hold on its permission, unless this one holds on.
+    /// An end signed by the session's key: the session ends.
     fn end_signed(&self, e: &wire::SessionEnd) -> Vec<Out> {
         let mut s = self.state();
         let answer = |success: bool, why: &str| {
@@ -540,9 +474,7 @@ impl MockCp {
         if !signed {
             return answer(false, "not signed by the session's key");
         }
-        if !s.holds_after_end {
-            s.sessions.remove(&e.session_uuid);
-        }
+        s.sessions.remove(&e.session_uuid);
         s.ended.push(e.session_uuid.clone());
         answer(true, "")
     }
@@ -583,8 +515,7 @@ impl MockCp {
     }
 
     fn renew(&self, r: wire::RenewSessionRequest) -> Vec<Out> {
-        let mut s = self.state();
-        s.permissions_seen += usize::from(r.permission.is_some());
+        let s = self.state();
         let Some(held) = s.sessions.get(&r.session_uuid) else {
             return refuse(&r.request_id, "no such session");
         };

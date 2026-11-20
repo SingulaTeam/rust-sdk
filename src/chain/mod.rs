@@ -27,8 +27,9 @@ mod deployment;
 pub mod front;
 #[cfg(feature = "http")]
 mod http;
+mod journal;
+mod logs;
 mod payments;
-mod permissions;
 mod rpc;
 #[cfg(feature = "client")]
 mod signing;
@@ -46,9 +47,11 @@ use alloy_sol_types::SolCall;
 pub use deployment::{Clock, Contracts, Deployment, Network};
 #[cfg(feature = "http")]
 pub use http::HttpRpc;
+pub use journal::{RegistryHistory, SubscriberLeaf, SubscriberLog};
+#[cfg(feature = "zk")]
+pub use journal::{WindowTree, WindowTreeError};
 pub use payments::{GasOp, Payment, fee_ceiling};
-pub use permissions::PermissionKeyCommitment;
-pub use rpc::{Block, Rpc, RpcError};
+pub use rpc::{Block, Header, Log, LogFilter, Rpc, RpcError};
 pub use stars::{ControlPlane, Role, Star};
 pub use subscriptions::{Subscription, TokenId, TxHash};
 
@@ -259,11 +262,9 @@ fn unix_time(seconds: u64, method: &'static str) -> Result<UnixTime, ChainError>
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::FixedBytes;
 
     use super::contracts::{
         ICPEndpointRegistry, IStarRegistry, ISubscriberRegistry, ISubscriptionNFT,
-        IVoucherKeyRegistry,
     };
     use super::testing::MockRpc;
     use super::*;
@@ -314,7 +315,6 @@ mod tests {
         send(&chain.control_planes());
         send(&chain.subscriber_commitments());
         send(&chain.subscriptions(Address([0; 20])));
-        send(&chain.permission_key_commitment(StarId(1), Epoch(1)));
     }
 
     #[tokio::test]
@@ -579,53 +579,6 @@ mod tests {
             (subs[1].starts_at, subs[1].expires_at, subs[1].active),
             (None, None, false),
             "not yet activated"
-        );
-    }
-
-    #[tokio::test]
-    async fn reads_a_permission_key_commitment() {
-        let mut rpc = mock();
-        let registry = addr("0xe88168636f525122c27482f09144759ea281869d");
-        let call = |window: u64| IVoucherKeyRegistry::getEpochKeyCall {
-            issuerStarId: U256::from(7),
-            epoch: U256::from(window),
-        };
-        rpc.answer(
-            registry,
-            &call(137),
-            &IVoucherKeyRegistry::getEpochKeyReturn {
-                keyHash: FixedBytes([9; 32]),
-                denominationGB: 5,
-                setAt: 1_760_000_000,
-                issuerActive: true,
-            },
-        );
-        rpc.answer(
-            registry,
-            &call(138),
-            &IVoucherKeyRegistry::getEpochKeyReturn {
-                keyHash: FixedBytes::ZERO,
-                denominationGB: 0,
-                setAt: 0,
-                issuerActive: true,
-            },
-        );
-        let chain = Chain::connect(rpc, SEPOLIA).await.expect("connects");
-        let k = chain
-            .permission_key_commitment(StarId(7), Epoch(137))
-            .await
-            .expect("reads")
-            .expect("committed");
-        assert_eq!(
-            (k.key_hash, k.packet_size, k.issuer_active),
-            ([9; 32], 5, true)
-        );
-        assert_eq!(
-            chain
-                .permission_key_commitment(StarId(7), Epoch(138))
-                .await
-                .expect("reads"),
-            None
         );
     }
 }

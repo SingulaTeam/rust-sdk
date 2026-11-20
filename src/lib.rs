@@ -13,25 +13,31 @@
 //! | Module          | Feature  | What it is                                                        |
 //! |-----------------|----------|-------------------------------------------------------------------|
 //! | crate root      | —        | Identifiers, the digests a session signs, the session key exchange |
+//! | `journal`       | —        | Rights, pings and attestations of the shared journal              |
 //! | `chain`         | `chain`  | Typed reads of the protocol's contracts                           |
 //! | `zk`            | `zk`     | Anonymous identities, the subscriber group, membership proofs     |
 //! | `client`        | `client` | Control Plane calls, and `client::Singula` over all of it         |
 //!
 //! Most applications start at `client::Singula`: `connect` opens a session
-//! and keeps it — reporting its traffic and renewing it — until it is closed.
+//! and keeps it — by pings on the day's right, or reports and renewals for a
+//! wallet's session — until it is closed.
 //!
 //! # The core, by hand
 //!
 //! What a session is made of, should you need the wire formats directly:
 //!
-//! 1. Sign in: the subscriber's wallet signs a [`SignInMessage`].
+//! 1. Admission: the day's [`journal::Right`] of one of the subscriber's
+//!    slots, and its [`journal::RightKey`]'s signature over the Control
+//!    Plane's challenge — or, for a wallet's session, a [`SignInMessage`].
 //! 2. Ask for a session, sending the public halves of a fresh
 //!    [`SessionKeypair`] and [`CheckpointKey`].
 //! 3. Open the node's [`SealedCredentials`] with [`SessionKeypair::open`],
 //!    checking them against the signer [`Address`] the node registered on
 //!    chain.
-//! 4. While the session runs, sign a [`Checkpoint`] whenever the Control Plane
-//!    asks, and a [`Renewal`] to keep the lease.
+//! 4. While the session runs, sign a [`journal::Ping`] every few minutes and
+//!    check the attestations each answer carries; a wallet's session signs a
+//!    [`Checkpoint`] whenever the Control Plane asks, and a [`Renewal`] to
+//!    keep the lease.
 
 #[cfg(feature = "chain")]
 pub mod chain;
@@ -42,6 +48,7 @@ mod eth;
 #[cfg(any(feature = "chain", feature = "zk"))]
 mod hex;
 mod id;
+pub mod journal;
 mod session;
 mod sign_in;
 mod signing;

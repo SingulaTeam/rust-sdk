@@ -2,10 +2,8 @@
 
 use alloy_primitives::{FixedBytes, U256};
 use alloy_sol_types::SolCall as _;
-use blind_rsa_signatures::SecretKeySha384PSSRandomized;
-use sha3::{Digest as _, Keccak256};
 
-use super::testing::{self, CP, MockCp, NODE, NODE_ADDRESS, PACKET_SIZE, TX, addr, alloy, window};
+use super::testing::{self, CP, MockCp, NODE, NODE_ADDRESS, TX, addr, alloy, window};
 use super::wallet::{LocalWallet, Wallet as _};
 use super::{
     ClientError, ControlPlaneClient, GovernanceAction, Participant, SessionRequest, Traffic,
@@ -13,20 +11,15 @@ use super::{
 };
 use crate::chain::contracts::{
     IEip712, IGasStation, IProtocolGovernor, ISingulaProtocol, IStarRegistry, ISubscriberRegistry,
-    ISubscriptionNFT, IVoucherKeyRegistry,
+    ISubscriptionNFT,
 };
 use crate::chain::testing::MockRpc;
 use crate::chain::{Chain, Network, Payment, TokenId, TxHash, fee_ceiling};
 use crate::id::{Address, Epoch};
-use crate::zk::{Claim, FieldElement, Group, Identity, Prover};
+use crate::zk::{FieldElement, Group, Identity, Prover};
 
 /// The gas fee `GasStation` quotes in these tests, whatever the operation.
 const GAS_FEE: u64 = 10u64.pow(17);
-
-/// The test issuer's key.
-fn issuer() -> (Vec<u8>, SecretKeySha384PSSRandomized) {
-    testing::issuer_key().clone()
-}
 
 /// A Control Plane, and a chain that knows about it, its node and `wallet`.
 async fn setup(wallet: Address) -> (MockCp, ControlPlaneClient, Chain<MockRpc>) {
@@ -38,8 +31,7 @@ async fn setup_with_slots(
     wallet: Address,
     slots: u8,
 ) -> (MockCp, ControlPlaneClient, Chain<MockRpc>) {
-    let (der, secret) = issuer();
-    let cp = MockCp::new(der.clone(), secret);
+    let cp = MockCp::new();
     let client = cp.serve().await;
     let node_signer = crate::eth::address_of(cp.state().node_signer.verifying_key());
 
@@ -57,24 +49,6 @@ async fn setup_with_slots(
             registerEpoch: 1,
         },
     );
-    let mut committed = der;
-    committed.extend_from_slice(&PACKET_SIZE.to_be_bytes());
-    // This window's key and the next one's: the same key, committed for each.
-    for w in [window(), window() + 1] {
-        rpc.answer(
-            addr("0xe88168636f525122c27482f09144759ea281869d"),
-            &IVoucherKeyRegistry::getEpochKeyCall {
-                issuerStarId: U256::from(CP.0),
-                epoch: U256::from(w),
-            },
-            &IVoucherKeyRegistry::getEpochKeyReturn {
-                keyHash: FixedBytes(Keccak256::digest(&committed).into()),
-                denominationGB: PACKET_SIZE,
-                setAt: 1_760_000_000,
-                issuerActive: true,
-            },
-        );
-    }
     for (name, contract) in [
         ("SingulaSubscriberRegistry", testing::REGISTRY),
         ("SingulaSubscription", testing::NFT),
@@ -120,6 +94,7 @@ async fn setup_with_slots(
         &U256::ZERO,
     );
     answer_the_set(&mut rpc, slots);
+    answer_the_journal(&mut rpc, &cp, slots);
     let mut governor_name = [0u8; 32];
     governor_name[..16].copy_from_slice(b"ProtocolGovernor");
     rpc.answer(
@@ -221,6 +196,93 @@ fn answer_the_set(rpc: &mut MockRpc, slots: u8) {
     );
 }
 
+/// The chain the journal reads: the test identity's slots registered long
+/// ago for an Orbit that outlasts the tests, and the test federation's
+/// Control Planes in `StarRegistry`. The tip is now, so today's tree and
+/// tomorrow's can both be built.
+fn answer_the_journal(rpc: &mut MockRpc, cp: &MockCp, slots: u8) {
+    use alloy_sol_types::SolEvent as _;
+    let emit = |rpc: &mut MockRpc, at: Address, block: u64, data: alloy_primitives::LogData| {
+        let topics = data.topics().iter().map(|t| t.0).collect();
+        rpc.emit(at, block, topics, data.data.to_vec());
+    };
+    for name in ["starRegistryFromBlock", "subscriberRegistryFromBlock"] {
+        let mut key = [0u8; 32];
+        key[..name.len()].copy_from_slice(name.as_bytes());
+        rpc.answer(
+            Network::ARBITRUM_SEPOLIA.directory,
+            &ISingulaProtocol::paramCall {
+                name: FixedBytes(key),
+            },
+            &U256::ZERO,
+        );
+    }
+    let (identity, _) = member();
+    let leaves: Vec<U256> =
+        [111u64, 222, 333]
+            .into_iter()
+            .map(U256::from)
+            .chain((0..slots).map(|slot| {
+                U256::from_be_bytes(identity.for_slot(slot).commitment().to_be_bytes())
+            }))
+            .collect();
+    for (index, commitment) in leaves.into_iter().enumerate() {
+        let registered = ISubscriberRegistry::Registered {
+            index: U256::from(index),
+            tokenId: U256::from(1),
+            commitment,
+        };
+        emit(
+            rpc,
+            addr(testing::REGISTRY),
+            3,
+            registered.encode_log_data(),
+        );
+    }
+    rpc.answer(
+        addr(testing::NFT),
+        &ISubscriptionNFT::expiresAtCall {
+            tokenId: U256::from(1),
+        },
+        &U256::from(4_000_000_000u64),
+    );
+
+    let stars = addr("0xced082443d1787e8014d2747f463ff9f2888447c");
+    let members = cp.state().journal.members();
+    for (id, signer) in &members {
+        let created = IStarRegistry::StarRegistered {
+            starId: U256::from(id.0),
+            owner: alloy(addr("0x00000000000000000000000000000000000000ee")),
+            signer: alloy(*signer),
+        };
+        emit(rpc, stars, 2, created.encode_log_data());
+        let promoted = IStarRegistry::RoleForced {
+            starId: U256::from(id.0),
+            oldRole: 1,
+            newRole: 2,
+            withSlashing: false,
+        };
+        emit(rpc, stars, 2, promoted.encode_log_data());
+    }
+    rpc.times.insert(2, 1_000);
+    rpc.times.insert(3, 1_000);
+    rpc.block = 10;
+    rpc.times
+        .insert(10, crate::id::UnixTime::now().0 + 2 * 86_400);
+    let version = crate::journal::RegistryVersion::new(
+        crate::journal::RegistryVersionId::new(
+            testing::CHAIN_ID,
+            stars,
+            2,
+            &MockRpc::header_of(2).hash,
+        ),
+        2,
+        crate::id::UnixTime(1_000),
+        members,
+    );
+    cp.state().journal.recorded_as(version);
+}
+
 /// An identity, and a group it belongs to.
 fn member() -> (Identity, Group) {
     let identity =
@@ -245,135 +307,6 @@ async fn lists_what_the_control_plane_serves() {
     assert_eq!(cp.list_countries().await.expect("answers")[0].nodes, 1);
     assert!(cp.health().await.expect("answers").healthy);
     assert_eq!(cp.network_info().await.expect("answers").chain_id, 421_614);
-}
-
-#[tokio::test]
-async fn runs_an_anonymous_session_from_permission_to_renewal() {
-    let (cp_state, cp, chain) = setup(Address([1; 20])).await;
-    let (identity, group) = member();
-    let prover = Prover::new().expect("the circuit loads");
-
-    let key = cp
-        .issuer_key(&chain)
-        .await
-        .expect("the key matches its commitment");
-    assert_eq!(
-        (key.window(), key.packet_size()),
-        (Epoch(window()), PACKET_SIZE)
-    );
-    let permission_proof = prover
-        .prove(
-            &identity,
-            &group,
-            Claim::Permission {
-                window: Epoch(window()),
-                index: 1,
-            },
-        )
-        .expect("proves");
-    let permission = cp
-        .take_permission(&key, 1, &permission_proof)
-        .await
-        .expect("signs the permission");
-    // The index is spent: asking for it again is refused as taken, which
-    // is how a device learns another took it.
-    let again = cp.take_permission(&key, 1, &permission_proof).await;
-    assert!(
-        matches!(again, Err(ClientError::PermissionTaken(1))),
-        "{again:?}"
-    );
-
-    let claim = Claim::Session {
-        control_plane: CP,
-        epoch: Epoch(window()),
-        index: 0,
-    };
-    let proof = prover.prove(&identity, &group, claim).expect("proves");
-    let mut session = cp
-        .open_session(
-            &chain,
-            SessionRequest::anonymous(proof, permission).node(NODE),
-        )
-        .await
-        .expect("opens");
-    assert_eq!(
-        (session.node(), session.report_to(), session.wallet()),
-        (NODE, CP, None)
-    );
-    let tunnel = TunnelSettings::decode(session.credentials()).expect("decodes");
-    assert_eq!((tunnel.address.as_str(), tunnel.port), (NODE_ADDRESS, 443));
-
-    // Two reports in a row: the second only verifies with the nonce the first got back.
-    cp.report(
-        &mut session,
-        Traffic {
-            up: 1_000,
-            down: 9_000,
-        },
-    )
-    .await
-    .expect("accepted");
-    cp.report(
-        &mut session,
-        Traffic {
-            up: 2_000,
-            down: 18_000,
-        },
-    )
-    .await
-    .expect("accepted with the new nonce");
-
-    let renewal_proof = prover
-        .prove(
-            &identity,
-            &group,
-            Claim::Permission {
-                window: Epoch(window()),
-                index: 2,
-            },
-        )
-        .expect("proves");
-    let renewal = cp
-        .take_permission(&key, 2, &renewal_proof)
-        .await
-        .expect("signs another");
-    let before = session.expires_at();
-    cp.renew(&mut session, Some(&renewal))
-        .await
-        .expect("renews");
-    assert!(session.expires_at() > before);
-    assert_eq!(
-        cp_state.state().permissions_seen,
-        2,
-        "one to open, one to renew"
-    );
-}
-
-#[tokio::test]
-async fn refuses_a_proof_for_another_control_plane() {
-    let (_, cp, chain) = setup(Address([1; 20])).await;
-    let (identity, group) = member();
-    let prover = Prover::new().expect("the circuit loads");
-    let elsewhere = Claim::Session {
-        control_plane: crate::StarId(9),
-        epoch: Epoch(window()),
-        index: 0,
-    };
-    let proof = prover.prove(&identity, &group, elsewhere).expect("proves");
-    let permission = super::Permission {
-        issuer: CP,
-        window: Epoch(window()),
-        prepared_message: Vec::new(),
-        signature: Vec::new(),
-        issuer_public_key: Vec::new(),
-    };
-    let result = cp
-        .open_session(&chain, SessionRequest::anonymous(proof, permission))
-        .await;
-    assert!(
-        matches!(result, Err(ClientError::Mismatch(_))),
-        "{result:?}"
-    );
 }
 
 #[tokio::test]
@@ -590,7 +523,7 @@ async fn singula_with_slots(
     let (cp_state, cp, chain) = setup_with_slots(wallet.address(), slots).await;
     let store = super::store::MemoryStore::new();
     let (identity, _) = member();
-    super::ledger::Ledger(&store)
+    super::records::Records(&store)
         .keep_identity(wallet.address(), &identity)
         .await
         .expect("keeps");
@@ -601,10 +534,11 @@ async fn singula_with_slots(
     )
 }
 
-/// Reports every tick, and renews almost at once: the session the mock opens
-/// runs for an hour.
+/// Pings and reports every tick, and renews almost at once: the session the
+/// mock opens runs for an hour.
 fn quick() -> super::Timing {
     super::Timing {
+        ping_every: std::time::Duration::from_millis(100),
         report_every: std::time::Duration::from_millis(100),
         renew_ahead: std::time::Duration::from_secs(3_599),
         renew_retry: std::time::Duration::from_millis(100),
@@ -631,195 +565,7 @@ async fn until(conn: &mut super::Connection, want: impl Fn(&super::Event) -> boo
 }
 
 #[tokio::test]
-async fn connects_reports_renews_and_gives_the_permission_back() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    let meter = || Traffic { up: 10, down: 20 };
-    let options = super::ConnectOptions::new()
-        .control_plane(CP)
-        .timing(quick());
-    let mut conn = singula
-        .connect(&wallet, options, meter)
-        .await
-        .expect("connects");
-    assert_eq!(
-        (conn.node(), conn.tunnel().address.as_str()),
-        (NODE, NODE_ADDRESS)
-    );
-
-    until(&mut conn, |e| matches!(e, super::Event::Reported(_))).await;
-    until(&mut conn, |e| matches!(e, super::Event::Renewed { .. })).await;
-    assert_eq!(
-        cp_state.state().permissions_seen,
-        1,
-        "renewal inside the window takes none"
-    );
-
-    // One permission is taken, and held while the session runs…
-    let ledger = singula.ledger();
-    let held = ledger
-        .permissions(Epoch(window()))
-        .await
-        .expect("reads")
-        .expect("the window's permissions");
-    assert_eq!(
-        held.permissions
-            .iter()
-            .filter(|p| p.holder.is_some())
-            .count(),
-        1
-    );
-    // …and the one held is kept for minutes past the last report, so it
-    // lapses only if the reports stop.
-    let kept = held
-        .permissions
-        .iter()
-        .find_map(|p| p.holder.as_ref().and(p.free_at))
-        .expect("a hold with a lapse time");
-    assert!(kept > crate::id::UnixTime::now().0 + 60, "{kept}");
-    conn.close().await;
-    // …and free once it is closed.
-    let after = ledger
-        .permissions(Epoch(window()))
-        .await
-        .expect("reads")
-        .expect("the window's permissions");
-    assert!(after.permissions.iter().all(|p| p.holder.is_none()));
-}
-
-#[tokio::test]
-async fn takes_an_index_per_concurrent_session_and_never_reuses_a_slot() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    let options = || super::ConnectOptions::new().control_plane(CP);
-    let first = singula
-        .connect(&wallet, options(), Traffic::default)
-        .await
-        .expect("connects");
-    let second = singula
-        .connect(&wallet, options(), Traffic::default)
-        .await
-        .expect("connects");
-    assert_eq!(
-        cp_state.state().permissions_taken,
-        2,
-        "an index for each session running at once"
-    );
-    let third = singula
-        .connect(&wallet, options(), Traffic::default)
-        .await
-        .expect("connects");
-    // Three permissions, three sessions: the fourth has nothing to hold.
-    let fourth = singula.connect(&wallet, options(), Traffic::default).await;
-    assert!(
-        matches!(fourth, Err(ClientError::NoPermissionFree)),
-        "{fourth:?}"
-    );
-    assert_eq!(cp_state.state().slots_seen, [0, 1, 2]);
-    for conn in [first, second, third] {
-        conn.close().await;
-    }
-}
-
-// An Orbit with k slots holds k identities, each with its own permissions:
-// k times as many sessions at once, and not one more.
-#[tokio::test]
-async fn takes_permissions_with_each_slots_identity() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula_with_slots(&wallet, 2).await;
-    let options = || super::ConnectOptions::new().control_plane(CP);
-    let mut open = Vec::new();
-    for _ in 0..2 * PACKET_SIZE {
-        open.push(
-            singula
-                .connect(&wallet, options(), Traffic::default)
-                .await
-                .expect("connects"),
-        );
-    }
-    let refused = singula.connect(&wallet, options(), Traffic::default).await;
-    assert!(
-        matches!(refused, Err(ClientError::NoPermissionFree)),
-        "{refused:?}"
-    );
-    let taken = cp_state.state().nullifiers_taken.clone();
-    assert_eq!(taken.len(), 6, "three permissions for each identity");
-    let mut distinct = taken.clone();
-    distinct.sort();
-    distinct.dedup();
-    assert_eq!(distinct.len(), 6, "no permission taken twice");
-    for conn in open {
-        conn.close().await;
-    }
-}
-
-#[tokio::test]
-async fn shares_the_window_with_the_subscriptions_other_devices() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    let options = || super::ConnectOptions::new().control_plane(CP);
-    // Another device took two of the three indices.
-    {
-        let mut s = cp_state.state();
-        let w = s.window;
-        s.indices_taken = vec![(w, 0), (w, 2)];
-    }
-    let conn = singula
-        .connect(&wallet, options(), Traffic::default)
-        .await
-        .expect("connects on the index left");
-    assert_eq!(
-        cp_state.state().permissions_taken,
-        1,
-        "the taken ones were refused, the free one signed"
-    );
-    let known = singula
-        .ledger()
-        .permissions(Epoch(window()))
-        .await
-        .expect("reads")
-        .expect("the window's permissions");
-    assert_eq!(
-        known
-            .permissions
-            .iter()
-            .map(|p| p.index)
-            .collect::<Vec<_>>(),
-        [1]
-    );
-    // Nothing is left for a second session at once.
-    let second = singula.connect(&wallet, options(), Traffic::default).await;
-    assert!(
-        matches!(second, Err(ClientError::NoPermissionFree)),
-        "{second:?}"
-    );
-    conn.close().await;
-}
-
-#[tokio::test]
-async fn proves_past_the_quota_slots_another_device_used() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    cp_state.state().slots_used_elsewhere = vec![0, 1];
-    let conn = singula
-        .connect(
-            &wallet,
-            super::ConnectOptions::new().control_plane(CP),
-            Traffic::default,
-        )
-        .await
-        .expect("connects on the first slot left");
-    let (seen, taken) = {
-        let s = cp_state.state();
-        (s.slots_seen.clone(), s.permissions_taken)
-    };
-    assert_eq!(seen, [2]);
-    assert_eq!(taken, 1, "one permission, kept through the retries");
-    conn.close().await;
-}
-
-#[tokio::test]
-async fn ends_a_session_whose_answer_it_refused_and_waits_out_the_hold() {
+async fn ends_a_session_whose_answer_it_refused() {
     let wallet = LocalWallet::random();
     let (cp_state, singula) = singula(&wallet).await;
     let options = || super::ConnectOptions::new().control_plane(CP);
@@ -839,77 +585,190 @@ async fn ends_a_session_whose_answer_it_refused_and_waits_out_the_hold() {
         "the refused session is ended"
     );
 
-    // Its permission waits out the Control Plane's hold; the next session
-    // takes another.
+    // The day's right is kept: the next session opens on it at once.
     cp_state.state().unsigned_credentials = false;
     let conn = singula
         .connect(&wallet, options(), Traffic::default)
         .await
-        .expect("connects on the next permission");
-    let presented = cp_state.state().permissions_presented.clone();
-    assert_ne!(
-        presented[0], presented[1],
-        "the held one is not offered yet"
+        .expect("connects again");
+    assert_eq!(
+        cp_state.state().journal.rights.len(),
+        1,
+        "one right for the day"
     );
     conn.close().await;
 }
 
 #[tokio::test]
-async fn an_anonymous_session_ends_with_its_own_key_on_close() {
+async fn a_session_on_a_right_pings_until_closed_then_ends_with_its_own_key() {
     let wallet = LocalWallet::random();
     let (cp_state, singula) = singula(&wallet).await;
-    let conn = singula
-        .connect(
-            &wallet,
-            super::ConnectOptions::new().control_plane(CP),
-            Traffic::default,
-        )
+    let options = super::ConnectOptions::new()
+        .control_plane(CP)
+        .timing(quick());
+    let mut conn = singula
+        .connect(&wallet, options, || Traffic { up: 10, down: 20 })
         .await
         .expect("connects");
+    assert_eq!(
+        (conn.node(), conn.tunnel().address.as_str()),
+        (NODE, NODE_ADDRESS)
+    );
+    until(
+        &mut conn,
+        |e| matches!(e, super::Event::Pinged { control_plane, .. } if *control_plane == CP),
+    )
+    .await;
+    until(&mut conn, |e| matches!(e, super::Event::Pinged { .. })).await;
+
     let id = conn.id().to_string();
+    let pinged = cp_state.state().journal.pings.len();
     conn.close().await;
-    assert_eq!(cp_state.state().ended, [id], "ended, not left to expire");
+    let s = cp_state.state();
+    assert_eq!(s.journal.opened_on_right, 1);
+    assert!(
+        s.journal.pings.len() > pinged,
+        "a last ping on close, so its seconds count"
+    );
+    assert!(
+        s.journal.pings.windows(2).all(|w| w[0].total <= w[1].total),
+        "totals never go back"
+    );
+    assert_eq!(s.ended, [id], "ended, not left to expire");
 }
 
 #[tokio::test]
-async fn a_permission_refused_as_held_comes_back_after_the_hold() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    let time = testing::ManualTime::at(crate::id::UnixTime::now());
-    let singula = singula.with_time(time.clone());
-    let options = || super::ConnectOptions::new().control_plane(CP);
-    // This Control Plane holds on after an end, as one whose lease has not
-    // run out yet.
-    cp_state.state().holds_after_end = true;
+async fn pings_move_to_a_control_plane_that_shows_a_majority() {
+    // One that reaches none, and one that claims one it does not have.
+    for failing in [testing::Acks::Short, testing::Acks::Forged] {
+        let wallet = LocalWallet::random();
+        let (cp_state, singula) = singula(&wallet).await;
+        // A second Control Plane of the same federation.
+        let other = MockCp::new();
+        other.state().journal = cp_state.state().journal.clone();
+        let other_star = crate::id::StarId(9);
+        let singula = singula.with_control_plane(other.serve_as(other_star).await);
 
-    let first = singula
+        let options = super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick());
+        let mut conn = singula
+            .connect(&wallet, options, Traffic::default)
+            .await
+            .expect("connects");
+        until(
+            &mut conn,
+            |e| matches!(e, super::Event::Pinged { control_plane, .. } if *control_plane == CP),
+        )
+        .await;
+
+        other.state().journal.rights = cp_state.state().journal.rights.clone();
+        cp_state.state().journal.acks = failing;
+        until(&mut conn, |e| {
+            matches!(e, super::Event::Pinged { control_plane, .. } if *control_plane == other_star)
+        })
+        .await;
+        conn.close().await;
+    }
+}
+
+#[tokio::test]
+async fn ends_when_the_network_closes_it_and_leaves_a_busy_slot() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula_with_slots(&wallet, 2).await;
+    let options = || {
+        super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick())
+    };
+    let mut conn = singula
         .connect(&wallet, options(), Traffic::default)
         .await
         .expect("connects");
-    first.close().await;
-    // Past the client's own wait, but the Control Plane still holds it.
-    time.set(crate::id::UnixTime(crate::id::UnixTime::now().0 + 120));
-    let refused = singula.connect(&wallet, options(), Traffic::default).await;
-    assert!(
-        matches!(refused, Err(ClientError::Refused { code: 9, .. })),
-        "{refused:?}"
-    );
-    // Not given up for the window: it waits once more, and the next
-    // session takes another.
-    let packet = singula
-        .ledger()
-        .permissions(Epoch(window()))
+    let first = cp_state
+        .state()
+        .journal
+        .rights
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    // Another device holds the slot: the Control Plane closes this session.
+    cp_state
+        .state()
+        .journal
+        .statuses
+        .insert(conn.id().to_string(), (2, "overlap".into()));
+    let ended = async {
+        while let Some(event) = conn.next_event().await {
+            if let super::Event::Ended(reason) = event {
+                return reason;
+            }
+        }
+        panic!("the connection stopped without ending");
+    };
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(10), ended)
         .await
-        .expect("reads")
-        .expect("the window's permissions");
-    assert!(packet.permissions.iter().all(|p| p.holder.is_none()));
-    assert!(packet.permissions.iter().any(|p| p.free_at.is_some()));
-    singula
+        .expect("in time");
+    assert_eq!(
+        reason,
+        super::EndReason::ClosedByNetwork(crate::journal::CloseReason::Overlap)
+    );
+
+    // The next session takes the other slot.
+    let next = singula
         .connect(&wallet, options(), Traffic::default)
         .await
-        .expect("connects on another permission")
-        .close()
-        .await;
+        .expect("connects");
+    let rights = cp_state.state().journal.rights.clone();
+    assert_eq!(rights.len(), 2, "a second slot's right");
+    assert!(rights.keys().any(|n| !first.contains(n)));
+    next.close().await;
+}
+
+#[tokio::test]
+async fn carries_a_session_past_midnight_on_the_next_days_right() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula(&wallet).await;
+    let end = epoch_start(window() + 1);
+    let time = testing::ManualTime::at(crate::id::UnixTime(end.0 - 30));
+    cp_state.state().clock = Some(time.clone());
+    let singula = singula.with_time(time.clone());
+
+    let options = super::ConnectOptions::new()
+        .control_plane(CP)
+        .timing(quick());
+    let mut conn = singula
+        .connect(&wallet, options, Traffic::default)
+        .await
+        .expect("connects");
+    until(&mut conn, |e| matches!(e, super::Event::Pinged { .. })).await;
+
+    // A minute and more past midnight, the next day's right takes over.
+    time.set(crate::id::UnixTime(end.0 + 61));
+    until(
+        &mut conn,
+        |e| matches!(e, super::Event::Pinged { total, .. } if *total < 30),
+    )
+    .await;
+    let (last, rights) = {
+        let s = cp_state.state();
+        (
+            s.journal.pings.last().cloned().expect("pings"),
+            s.journal.rights.len(),
+        )
+    };
+    assert_eq!(
+        last.window,
+        Epoch(window() + 1),
+        "under the new day's right"
+    );
+    assert_eq!(rights, 2, "today's right and tomorrow's");
+    assert_eq!(
+        last.session.to_string(),
+        conn.id().to_string(),
+        "the same session"
+    );
+    conn.close().await;
 }
 
 #[tokio::test]
@@ -957,53 +816,6 @@ fn epoch_start(w: u64) -> crate::id::UnixTime {
 }
 
 #[tokio::test]
-async fn renews_into_the_next_window_with_its_packet() {
-    let wallet = LocalWallet::random();
-    let (cp_state, singula) = singula(&wallet).await;
-    // Half a minute before the window turns.
-    let w = window();
-    let time = testing::ManualTime::at(crate::id::UnixTime(epoch_start(w + 1).0 - 30));
-    cp_state.state().clock = Some(time.clone());
-    let singula = singula.with_time(time.clone());
-
-    let options = super::ConnectOptions::new()
-        .control_plane(CP)
-        .timing(quick());
-    let mut conn = singula
-        .connect(&wallet, options, Traffic::default)
-        .await
-        .expect("connects");
-
-    // The window turns before the first renewal.
-    time.set(crate::id::UnixTime(epoch_start(w + 1).0 + 10));
-    cp_state.state().window = w + 1;
-    until(&mut conn, |e| matches!(e, super::Event::Renewed { .. })).await;
-
-    let counts = {
-        let s = cp_state.state();
-        (s.permissions_taken, s.permissions_seen)
-    };
-    assert_eq!(counts, (2, 2), "a permission taken and spent per window");
-    let next = singula
-        .ledger()
-        .permissions(Epoch(w + 1))
-        .await
-        .expect("reads")
-        .expect("the new window's permissions");
-    let held: Vec<_> = next
-        .permissions
-        .iter()
-        .filter_map(|p| p.holder.clone())
-        .collect();
-    assert_eq!(
-        held,
-        [conn.id().to_string()],
-        "the session holds the new window's permission"
-    );
-    conn.close().await;
-}
-
-#[tokio::test]
 async fn ends_when_renewal_is_refused_until_expiry() {
     let wallet = LocalWallet::random();
     let (cp_state, singula) = singula(&wallet).await;
@@ -1013,6 +825,7 @@ async fn ends_when_renewal_is_refused_until_expiry() {
 
     let options = super::ConnectOptions::new()
         .control_plane(CP)
+        .access(super::Access::Wallet)
         .timing(quick());
     let mut conn = singula
         .connect(&wallet, options, Traffic::default)
@@ -1035,16 +848,6 @@ async fn ends_when_renewal_is_refused_until_expiry() {
         .await
         .expect("in time");
     assert_eq!(reason, super::EndReason::Expired);
-    let packet = singula
-        .ledger()
-        .permissions(Epoch(window()))
-        .await
-        .expect("reads")
-        .expect("the window's permissions");
-    assert!(
-        packet.permissions.iter().all(|p| p.holder.is_none()),
-        "its permission is free again"
-    );
 }
 
 #[tokio::test]
@@ -1097,11 +900,208 @@ async fn refuses_an_endpoint_that_changes_what_the_url_means() {
 
 #[tokio::test]
 async fn reaches_a_control_plane_through_a_transport_the_application_gives() {
-    let (der, secret) = issuer();
-    let port = MockCp::new(der, secret).listen().await;
+    let port = MockCp::new().listen().await;
     // The application's tunnel, played by a plain connection.
     let cp = ControlPlaneClient::through(CP, move || {
         tokio::net::TcpStream::connect(("127.0.0.1", port))
     });
     assert!(cp.health().await.expect("answers").healthy);
+}
+
+// ── The shared journal ──────────────────────────────────────────────────────
+
+mod journal {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::client::testing::Acks;
+    use crate::id::{SessionId, StarId, UnixTime};
+    use crate::journal::{
+        AckError, CloseReason, JournalParams, Nullifier, Ping, Right, RightKey, SessionStatus,
+    };
+
+    const PARAMS: JournalParams = JournalParams::new(testing::CHAIN_ID);
+
+    /// A right of the test identity's day, with its key. The test Control
+    /// Plane checks the key's signatures, not the proof.
+    fn right(nullifier: u8) -> (Right, Arc<RightKey>) {
+        let key = RightKey::derive(&[nullifier; 32], PARAMS, Epoch(window())).expect("derives");
+        let right = Right::new(
+            Epoch(window()),
+            0,
+            Nullifier([nullifier; 32]),
+            key.public_key(),
+            [[0; 32]; 8],
+        );
+        (right, Arc::new(key))
+    }
+
+    fn ping(
+        right: &Right,
+        key: &RightKey,
+        session: &SessionId,
+        total: u64,
+    ) -> crate::journal::SignedPing {
+        key.sign_ping(
+            PARAMS,
+            Ping::new(right.window, right.nullifier, session.clone(), NODE, total),
+        )
+    }
+
+    #[tokio::test]
+    async fn opens_a_session_on_a_right() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (right, key) = right(5);
+        let session = cp
+            .open_session(&chain, SessionRequest::on_right(right.clone(), key, PARAMS))
+            .await
+            .expect("the right opens a session");
+        let tunnel = TunnelSettings::decode(session.credentials()).expect("decodes");
+        assert_eq!(tunnel.address, NODE_ADDRESS);
+        let s = mock.state();
+        assert_eq!(s.journal.opened_on_right, 1);
+        assert!(s.journal.rights.contains_key(&right.nullifier.0));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_challenge_naming_another_control_plane() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        mock.state().journal.challenge_names = StarId(99);
+        let (right, key) = right(5);
+        let result = cp
+            .open_session(&chain, SessionRequest::on_right(right, key, PARAMS))
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::Untrusted(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            mock.state().journal.opened_on_right,
+            0,
+            "nothing was signed for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_committed_by_a_checked_majority() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (right, key) = right(5);
+        let session = cp
+            .open_session(
+                &chain,
+                SessionRequest::on_right(right.clone(), Arc::clone(&key), PARAMS),
+            )
+            .await
+            .expect("opens");
+        let versions = mock.state().journal.versions();
+        let signed = ping(&right, &key, session.id(), 300);
+        let traffic = Traffic { up: 10, down: 20 };
+
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        let committed = ack
+            .committed(&versions, PARAMS, UnixTime::now())
+            .expect("a majority");
+        assert_eq!(committed.version, versions.latest().id);
+        assert_eq!(
+            mock.state().journal.pings.last().map(|p| p.total),
+            Some(300)
+        );
+
+        mock.state().journal.acks = Acks::Short;
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        assert!(matches!(
+            ack.committed(&versions, PARAMS, UnixTime::now()),
+            Err(AckError::NoQuorum { .. })
+        ));
+
+        mock.state().journal.acks = Acks::Forged;
+        let ack = cp
+            .ping(PARAMS, &signed, traffic, None)
+            .await
+            .expect("taken");
+        assert!(matches!(
+            ack.committed(&versions, PARAMS, UnixTime::now()),
+            Err(AckError::BadAttestation(_))
+        ));
+
+        mock.state().journal.acks = Acks::OtherPing;
+        let result = cp.ping(PARAMS, &signed, traffic, None).await;
+        assert!(
+            matches!(result, Err(ClientError::Untrusted(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_days_right_travels_with_its_first_ping() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, chain) = setup(wallet).await;
+        let (today, key) = right(5);
+        let session = cp
+            .open_session(&chain, SessionRequest::on_right(today, key, PARAMS))
+            .await
+            .expect("opens");
+        let (tomorrow, next_key) = right(6);
+        let first = ping(&tomorrow, &next_key, session.id(), 30);
+
+        let refused = cp.ping(PARAMS, &first, Traffic::default(), None).await;
+        assert!(
+            matches!(refused, Err(ClientError::Refused { .. })),
+            "an unknown right's ping"
+        );
+        cp.ping(PARAMS, &first, Traffic::default(), Some(&tomorrow))
+            .await
+            .expect("taken with its right");
+        assert!(
+            mock.state()
+                .journal
+                .rights
+                .contains_key(&tomorrow.nullifier.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn says_why_a_session_closed() {
+        let wallet = LocalWallet::random().address();
+        let (mock, cp, _) = setup(wallet).await;
+        let open: SessionId = "8f14e45f-ceea-467f-a8d5-000000000001"
+            .parse()
+            .expect("an id");
+        let closed: SessionId = "8f14e45f-ceea-467f-a8d5-000000000002"
+            .parse()
+            .expect("an id");
+        let unknown: SessionId = "8f14e45f-ceea-467f-a8d5-000000000003"
+            .parse()
+            .expect("an id");
+        {
+            let mut s = mock.state();
+            s.journal
+                .statuses
+                .insert(open.to_string(), (1, String::new()));
+            s.journal
+                .statuses
+                .insert(closed.to_string(), (2, "overlap".into()));
+        }
+        assert!(matches!(
+            cp.session_status(&open).await,
+            Ok(SessionStatus::Open { .. })
+        ));
+        assert_eq!(
+            cp.session_status(&closed).await.expect("answers"),
+            SessionStatus::Closed(CloseReason::Overlap)
+        );
+        assert_eq!(
+            cp.session_status(&unknown).await.expect("answers"),
+            SessionStatus::Unknown
+        );
+    }
 }

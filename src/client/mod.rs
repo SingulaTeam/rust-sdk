@@ -4,17 +4,20 @@
 //! and reached at the endpoint it published on chain. What a client does with
 //! it, in order:
 //!
-//! 1. [`issuer_key`](ControlPlaneClient::issuer_key) — the key this window's
-//!    permissions are signed under, checked against its on-chain commitment.
-//! 2. [`take_permission`](ControlPlaneClient::take_permission) — one of this
-//!    window's [`Permission`]s, signed blind so the issuer cannot recognise
-//!    it later. Each index once per subscription per window, network-wide.
-//! 3. [`list_nodes`](ControlPlaneClient::list_nodes) — the nodes it can serve.
-//! 4. [`open_session`](ControlPlaneClient::open_session) — a session on a
-//!    node, admitted by a membership proof and one permission. The node's
-//!    answer is checked against its signer key on chain and decrypted.
-//! 5. [`report`](ControlPlaneClient::report) and
-//!    [`renew`](ControlPlaneClient::renew) — while the session runs.
+//! 1. [`list_nodes`](ControlPlaneClient::list_nodes) — the nodes it can serve.
+//! 2. [`open_session`](ControlPlaneClient::open_session) — a session on a
+//!    node, admitted by the day's right of one of the subscription's slots
+//!    ([`SessionRequest::on_right`]). The node's answer is checked against
+//!    its signer key on chain and decrypted.
+//! 3. [`ping`](ControlPlaneClient::ping) — while the session runs, its
+//!    seconds so far, answered with attestations a client checks against the
+//!    chain ([`Ack::committed`]).
+//! 4. [`session_status`](ControlPlaneClient::session_status) — why a session
+//!    closed, from any Control Plane.
+//!
+//! A wallet's session is admitted by its sign-in instead, and kept by
+//! [`report`](ControlPlaneClient::report) and
+//! [`renew`](ControlPlaneClient::renew).
 //!
 //! Every call is its own short conversation: it opens the stream, says one
 //! thing, waits for the answer and closes. Nothing is held open between
@@ -23,8 +26,8 @@
 //! the call that opened it, known to the Control Plane by its checkpoint key
 //! rather than by a connection.
 //!
-//! Anything a decision rests on — which Control Planes exist, who runs a
-//! node, which key a window's permissions must be signed under — is read
+//! Anything a decision rests on — which Control Planes exist and with which
+//! keys, who runs a node, which tree a right is proved against — is read
 //! from the chain, never taken from the Control Plane being asked.
 
 mod account;
@@ -33,11 +36,13 @@ mod call;
 mod connect;
 mod connection;
 mod governance;
-mod ledger;
+mod journal;
 mod nodes;
-mod permission;
+mod pinger;
 mod proto;
+mod records;
 mod relay;
+mod rights;
 mod session;
 pub mod store;
 #[cfg(test)]
@@ -63,15 +68,15 @@ pub use auth::{SIGN_IN_LIFETIME, WalletAuth, WalletAuthError};
 pub use connect::{Access, ConnectOptions, Singula};
 pub use connection::{Connection, EndReason, Event, Timing, TrafficMeter};
 pub use governance::{GovernanceAction, Participant, Vote};
+pub use journal::Ack;
 pub use nodes::{CountryNodes, NodeCandidate};
-pub use permission::{IssuerKey, Permission};
 pub use relay::{Activated, MAX_SLOTS, Minted, RELAY_DEADLINE};
 pub use session::{Egress, Session, SessionRequest, Traffic};
 pub use time::{SystemTime, TimeSource};
 pub use tunnel::{Cover, TunnelSettings};
 
 use crate::chain::{ChainError, ControlPlane};
-use crate::id::{StarId, UnixTime};
+use crate::id::StarId;
 use crate::session::OpenError;
 
 /// The port a Control Plane listens on when its registry entry names none.
@@ -359,23 +364,16 @@ pub enum ClientError {
     /// A membership proof could not be made.
     #[error(transparent)]
     Prove(#[from] crate::zk::ProveError),
-    /// The subscriber's identity is not in the anonymity set: the
+    /// The subscriber's identity is not in the anonymity set — the
     /// subscription was activated without it, or the registration has not
-    /// reached the chain yet.
-    #[error("this identity is not in the anonymity set")]
+    /// reached the chain yet — or no slot of it is a member for the whole
+    /// day, because the Orbit ends during it.
+    #[error("this identity is not in the anonymity set for the day")]
     NotRegistered,
-    /// Every permission the subscription may take this window is taken:
-    /// held by this client's sessions, or taken by its other devices.
-    #[error("every permission of this window is taken")]
-    NoPermissionFree,
-    /// The permission at this index was taken already this window, by
-    /// another of the subscription's devices or an earlier request.
-    #[error("permission {0} of this window is taken already")]
-    PermissionTaken(u32),
-    /// No permission is free now, but one whose session has ended will be
-    /// once the Control Planes' hold on it runs out, at this time.
-    #[error("no permission is free until {}", .0 .0)]
-    PermissionFreeAt(UnixTime),
+    /// A ping's answer did not show a strict majority of the Control
+    /// Planes recorded it.
+    #[error("the ping was not recorded by a majority: {0}")]
+    NotCommitted(#[from] crate::journal::AckError),
     /// The Control Plane admitted a session on `node`, and the client refused
     /// the node's answer: it did not check out against the chain. Try another
     /// node; this one, or the path to it, does not answer as it must.

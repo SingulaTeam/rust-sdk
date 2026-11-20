@@ -9,12 +9,14 @@ use alloy_primitives::hex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::rpc::{Block, Rpc, RpcError};
-use crate::id::Address;
+use super::rpc::{Block, Header, Log, LogFilter, Rpc, RpcError};
+use crate::id::{Address, UnixTime};
 
-/// The largest response accepted. The biggest read this crate makes is a
-/// page of 500 commitments, a few tens of kilobytes; this leaves room for any
-/// honest answer and none for a node that streams without end.
+/// The largest response accepted. The biggest reads this crate makes are a
+/// page of 500 commitments and a span of registry logs, tens to hundreds of
+/// kilobytes; this leaves room for any honest answer and none for a node
+/// that streams without end. A span too large for it is asked for again in
+/// halves.
 const MAX_RESPONSE: usize = 8 << 20;
 
 /// An [`Rpc`] over HTTPS.
@@ -149,13 +151,73 @@ impl Rpc for HttpRpc {
     }
 
     async fn call(&self, to: Address, data: &[u8], block: Block) -> Result<Vec<u8>, RpcError> {
-        let block = match block {
-            Block::Latest => Value::from("latest"),
-            Block::Number(n) => Value::from(format!("{n:#x}")),
-        };
-        let params = json!([{ "to": to.to_string(), "data": hex::encode_prefixed(data) }, block]);
+        let params =
+            json!([{ "to": to.to_string(), "data": hex::encode_prefixed(data) }, tag(block)]);
         data_bytes(&self.request("eth_call", params).await?)
     }
+
+    async fn header(&self, block: Block) -> Result<Header, RpcError> {
+        let b = self
+            .request("eth_getBlockByNumber", json!([tag(block), false]))
+            .await?;
+        let timestamp = i64::try_from(quantity(&b["timestamp"])?)
+            .map_err(|_| RpcError::Malformed("a timestamp out of range"))?;
+        Ok(Header::new(
+            quantity(&b["number"])?,
+            word(&b["hash"])?,
+            UnixTime(timestamp),
+        ))
+    }
+
+    async fn logs(&self, filter: &LogFilter) -> Result<Vec<Log>, RpcError> {
+        let events: Vec<String> = filter.events.iter().map(hex::encode_prefixed).collect();
+        let params = json!([{
+            "address": filter.address.to_string(),
+            "topics": [events],
+            "fromBlock": format!("{:#x}", filter.from),
+            "toBlock": format!("{:#x}", filter.to),
+        }]);
+        let answer = self.request("eth_getLogs", params).await?;
+        let entries = answer
+            .as_array()
+            .ok_or(RpcError::Malformed("not a list of logs"))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for l in entries {
+            if l["removed"].as_bool() == Some(true) {
+                continue;
+            }
+            let topics = l["topics"]
+                .as_array()
+                .ok_or(RpcError::Malformed("a log without topics"))?
+                .iter()
+                .map(word)
+                .collect::<Result<_, _>>()?;
+            out.push(Log::new(
+                quantity(&l["blockNumber"])?,
+                word(&l["blockHash"])?,
+                quantity(&l["logIndex"])?,
+                topics,
+                data_bytes(&l["data"])?,
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// How JSON-RPC names a block.
+fn tag(block: Block) -> Value {
+    match block {
+        Block::Latest => Value::from("latest"),
+        Block::Finalized => Value::from("finalized"),
+        Block::Number(n) => Value::from(format!("{n:#x}")),
+    }
+}
+
+/// A 32-byte value: a hash or a topic.
+fn word(v: &Value) -> Result<[u8; 32], RpcError> {
+    data_bytes(v)?
+        .try_into()
+        .map_err(|_| RpcError::Malformed("not 32 bytes"))
 }
 
 impl fmt::Debug for HttpRpc {

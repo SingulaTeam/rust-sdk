@@ -10,7 +10,6 @@
 use std::time::Duration;
 
 use rand_core::{OsRng, RngCore as _};
-use tokio_stream::StreamExt as _;
 
 use super::proto::client::client_service_client::ClientServiceClient;
 use super::proto::client::control_plane_message::Message as Inbound;
@@ -40,6 +39,16 @@ pub(super) enum Step<T> {
     Skip,
 }
 
+/// What to do with one message in a [`dialogue`].
+pub(super) enum Turn<T> {
+    /// It is the answer.
+    Done(Result<T, ClientError>),
+    /// It asks for more: send this, and keep reading.
+    Send(Box<Outbound>),
+    /// It belongs to some other conversation; keep reading.
+    Skip,
+}
+
 /// Holds `conversation` with `cp` and returns the first answer `pick`
 /// accepts.
 ///
@@ -51,6 +60,21 @@ pub(super) async fn exchange<T>(
     conversation: Conversation<'_>,
     mut pick: impl FnMut(Inbound) -> Step<T>,
 ) -> Result<T, ClientError> {
+    dialogue(cp, conversation, |m| match pick(m) {
+        Step::Done(result) => Turn::Done(result),
+        Step::Skip => Turn::Skip,
+    })
+    .await
+}
+
+/// Like [`exchange`], for a conversation of several turns on one stream: an
+/// answer may call for another message — a challenge to be signed, say —
+/// which `respond` returns as [`Turn::Send`].
+pub(super) async fn dialogue<T>(
+    cp: &ControlPlaneClient,
+    conversation: Conversation<'_>,
+    mut respond: impl FnMut(Inbound) -> Turn<T>,
+) -> Result<T, ClientError> {
     let Conversation {
         auth,
         request,
@@ -61,17 +85,20 @@ pub(super) async fn exchange<T>(
             "the sign-in is for another Control Plane",
         ));
     }
-    let outbound: Vec<ClientMessage> = auth
+    // The outbound half stays open until the answer arrives: closing it
+    // first would tell the Control Plane the conversation was over.
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let send = |m: Outbound| sender.send(ClientMessage { message: Some(m) }).is_ok();
+    for m in auth
         .map(|a| Outbound::Auth(a.to_wire()))
         .into_iter()
         .chain(messages)
-        .map(|m| ClientMessage { message: Some(m) })
-        .collect();
+    {
+        send(m);
+    }
 
     let conversation = async {
-        // The outbound half stays open until the answer arrives: closing it
-        // first would tell the Control Plane the conversation was over.
-        let outbound = tokio_stream::iter(outbound).chain(tokio_stream::pending());
+        let outbound = tokio_stream::wrappers::UnboundedReceiverStream::new(receiver);
         let mut inbound = ClientServiceClient::new(cp.channel.clone())
             .connect(outbound)
             .await
@@ -101,9 +128,14 @@ pub(super) async fn exchange<T>(
                         message: a.error_message,
                     });
                 }
-                Some(other) => match pick(other) {
-                    Step::Done(result) => return result,
-                    Step::Skip => {}
+                Some(other) => match respond(other) {
+                    Turn::Done(result) => return result,
+                    Turn::Send(m) => {
+                        if !send(*m) {
+                            return Err(ClientError::Closed);
+                        }
+                    }
+                    Turn::Skip => {}
                 },
                 None => {}
             }

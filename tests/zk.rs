@@ -16,8 +16,8 @@ use std::str::FromStr as _;
 use ark_ff::PrimeField as _;
 use ark_groth16::{Groth16, PreparedVerifyingKey, Proof, VerifyingKey, prepare_verifying_key};
 use serde_json::Value;
+use singula::Epoch;
 use singula::zk::{AccessProof, Claim, FieldElement, Group, Identity, Prover};
-use singula::{Epoch, StarId};
 
 /// The JavaScript client's identity, and the group it was tested in.
 const SECRET: &str = "0x08207bd92786697f8bed5caf78eda4d3b78fbc3326eb624744b966e7f94f5f59";
@@ -27,24 +27,6 @@ const MEMBERS: [&str; 4] = [
     "333",
     "15653118452981836033022399046009658219270373379659789120083529738828725496177",
 ];
-
-/// The Control Plane's `SemaphoreHash` of the claims below.
-const SESSION_MESSAGE: &str =
-    "343371210433890290056162609015838183378480827683322587048381917224414179832";
-const SESSION_SCOPE: &str =
-    "144238274787227100379747289347751931288527938002097690447946830657197365998";
-const PACKET_SCOPE: &str =
-    "215721150169798234869930996536229829395638981024187311208781748876391599088";
-
-const SESSION: Claim = Claim::Session {
-    control_plane: StarId(7),
-    epoch: Epoch(137),
-    index: 3,
-};
-const PACKET: Claim = Claim::Permission {
-    window: Epoch(137),
-    index: 3,
-};
 
 struct Setup {
     prover: Prover,
@@ -88,56 +70,106 @@ impl Setup {
     }
 }
 
-#[test]
-fn a_session_proof_passes_the_control_planes_check() {
-    let s = Setup::new();
-    let proof = s.prove(SESSION);
-    assert_eq!(proof.merkle_root, s.group.root());
-    assert!(s.verifies(&proof, SESSION_MESSAGE, SESSION_SCOPE));
+/// Right `a` of the journal's fixture: window 10, its key, and the Control
+/// Plane's `SemaphoreHash` of the right's scope and message.
+const RIGHT_KEY: (&str, &str) = (
+    "e417ce2cc31ef29ce38c7a1e75631e8d8c8209a4f508b8e81c74d41c14ccc431",
+    "0d2c42f380d728d51d87e4b26261bc4b3d4a6f5459c0b8b6d1077e19ef75c73a",
+);
+const RIGHT_SCOPE: &str =
+    "447793967648333678719443863230786612109752310857686584872885604805821712085";
+const RIGHT_MESSAGE: &str =
+    "52204751582231114037403491615054938693844254530108889856078236979011909626";
+
+fn right_claim(key: (&str, &str)) -> Claim {
+    right_claim_on(Epoch(10), key)
+}
+
+fn right_claim_on(window: Epoch, key: (&str, &str)) -> Claim {
+    let bytes = |s: &str| -> [u8; 32] {
+        hex::decode(s)
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    };
+    Claim::Right {
+        window,
+        key: (bytes(key.0), bytes(key.1)),
+    }
 }
 
 #[test]
-fn a_packet_proof_passes_the_control_planes_check() {
+fn a_right_proof_passes_the_control_planes_check() {
     let s = Setup::new();
-    let proof = s.prove(PACKET);
-    assert!(s.verifies(&proof, PACKET_SCOPE, PACKET_SCOPE));
+    let proof = s.prove(right_claim(RIGHT_KEY));
+    assert!(s.verifies(&proof, RIGHT_MESSAGE, RIGHT_SCOPE));
+    let right = proof.to_right(0);
+    assert_eq!(right.nullifier.0, proof.nullifier.to_be_bytes());
+
+    // One slot, one nullifier a day, whatever key it delegates to.
+    let other_key = s.prove(right_claim((RIGHT_KEY.1, RIGHT_KEY.0)));
+    assert_eq!(other_key.nullifier, proof.nullifier);
+    assert!(
+        !s.verifies(&other_key, RIGHT_MESSAGE, RIGHT_SCOPE),
+        "the message binds the key"
+    );
 }
 
 #[test]
-fn a_proof_is_good_for_its_own_claim_only() {
-    let s = Setup::new();
-    let session = s.prove(SESSION);
-    assert!(!s.verifies(&session, PACKET_SCOPE, PACKET_SCOPE));
-    // The same slot at another Control Plane or in another epoch has another scope.
-    let other = s.prove(Claim::Session {
-        control_plane: StarId(8),
-        epoch: Epoch(137),
-        index: 3,
-    });
-    assert!(!s.verifies(&other, SESSION_MESSAGE, SESSION_SCOPE));
+fn the_fixtures_right_verifies_as_we_hash_it() {
+    // Made by the JavaScript client library, checked by the Control Plane's
+    // Go journal; here against the scope and message this crate computes.
+    let f: Value = serde_json::from_str(include_str!("data/journal-fixture.json"))
+        .expect("the fixture parses");
+    let r = &f["rights"]["a"];
+    let field = |v: &Value| {
+        let bytes = hex::decode(v.as_str().expect("hex").trim_start_matches("0x")).expect("hex");
+        Fr::from_be_bytes_mod_order(&bytes)
+    };
+    let mut points = [[0u8; 32]; 8];
+    for (p, v) in points
+        .iter_mut()
+        .zip(r["points"].as_array().expect("points"))
+    {
+        let raw = hex::decode(v.as_str().expect("hex").trim_start_matches("0x")).expect("hex");
+        p[32 - raw.len()..].copy_from_slice(&raw);
+    }
+    let signals = [
+        field(&f["sweepRoot"]),
+        field(&r["nullifier"]),
+        Fr::from_str(RIGHT_MESSAGE).unwrap_or_else(|()| panic!("a field element")),
+        Fr::from_str(RIGHT_SCOPE).unwrap_or_else(|()| panic!("a field element")),
+    ];
+    let proof = unpack(&points).expect("points on their curves");
+    assert!(
+        Groth16::<Bn254>::verify_proof(&control_plane_key(), &proof, &signals).unwrap_or(false)
+    );
 }
 
 #[test]
 fn the_nullifier_is_fixed_by_the_claim() {
     let s = Setup::new();
-    let (first, again) = (s.prove(SESSION), s.prove(SESSION));
-    assert_eq!(
-        first.nullifier, again.nullifier,
-        "the same slot cannot be spent twice"
-    );
+    let claim = right_claim(RIGHT_KEY);
+    let (first, again) = (s.prove(claim), s.prove(claim));
+    assert_eq!(first.nullifier, again.nullifier, "one right per slot a day");
     assert_ne!(
         first.points, again.points,
         "proofs are randomised, so they do not link"
     );
-    assert_ne!(first.nullifier, s.prove(PACKET).nullifier);
+    let tomorrow = right_claim_on(Epoch(11), RIGHT_KEY);
+    assert_ne!(
+        first.nullifier,
+        s.prove(tomorrow).nullifier,
+        "days do not link"
+    );
 }
 
 #[test]
 fn an_altered_proof_fails() {
     let s = Setup::new();
-    let mut proof = s.prove(SESSION);
+    let mut proof = s.prove(right_claim(RIGHT_KEY));
     proof.points.swap(2, 3);
-    assert!(!s.verifies(&proof, SESSION_MESSAGE, SESSION_SCOPE));
+    assert!(!s.verifies(&proof, RIGHT_MESSAGE, RIGHT_SCOPE));
 }
 
 #[test]
@@ -145,7 +177,7 @@ fn a_stranger_cannot_prove() {
     let s = Setup::new();
     let stranger = Identity::from_signature("0x00");
     assert!(matches!(
-        s.prover.prove(&stranger, &s.group, SESSION),
+        s.prover.prove(&stranger, &s.group, right_claim(RIGHT_KEY)),
         Err(singula::zk::ProveError::NotAMember)
     ));
 }
@@ -198,4 +230,27 @@ fn control_plane_key() -> PreparedVerifyingKey<Bn254> {
             .map(g1)
             .collect(),
     })
+}
+
+#[test]
+fn an_identitys_right_key_is_derived_from_its_secret() {
+    use singula::journal::{JournalParams, RightKey};
+    let identity = Identity::from_secret(SECRET).expect("a valid secret");
+    let secret: [u8; 32] = hex::decode(&SECRET[2..])
+        .expect("valid hex")
+        .try_into()
+        .expect("32 bytes");
+    let params = JournalParams::new(421_614);
+    let from_identity = identity.right_key(params, Epoch(170)).expect("derives");
+    let from_bytes = RightKey::derive(&secret, params, Epoch(170)).expect("derives");
+    assert_eq!(from_identity.public_key(), from_bytes.public_key());
+    let next_slot = identity
+        .for_slot(1)
+        .right_key(params, Epoch(170))
+        .expect("derives");
+    assert_ne!(
+        next_slot.public_key(),
+        from_identity.public_key(),
+        "each slot its own key"
+    );
 }

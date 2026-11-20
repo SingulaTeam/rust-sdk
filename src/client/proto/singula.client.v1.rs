@@ -3,7 +3,7 @@
 pub struct ClientMessage {
     #[prost(
         oneof = "client_message::Message",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub message: ::core::option::Option<client_message::Message>,
 }
@@ -45,6 +45,12 @@ pub mod client_message {
         AddSlotsRequest(super::AddSlotsRequest),
         #[prost(message, tag = "18")]
         GovernanceRequest(super::GovernanceRequest),
+        #[prost(message, tag = "19")]
+        LedgerChallenge(super::LedgerChallengeRequest),
+        #[prost(message, tag = "20")]
+        LedgerPing(super::LedgerPing),
+        #[prost(message, tag = "21")]
+        LedgerSessionStatus(super::LedgerSessionStatusRequest),
     }
 }
 /// ClientAuth authenticates client using wallet signature.
@@ -153,6 +159,29 @@ pub struct SessionRequest {
     /// picked every node could steer its clients onto nodes it works with.
     #[prost(uint64, tag = "11")]
     pub node_star_id: u64,
+    /// A session opened on a right of the shared journal (internal/ledger)
+    /// instead of `access` and `permission`. The right is the day's slot; the
+    /// signature proves the sender holds its key. Set, the stream needs no other
+    /// credential, and checkpoints are LedgerPing rather than TrafficCheckpoint.
+    #[prost(message, optional, tag = "12")]
+    pub ledger: ::core::option::Option<LedgerAccess>,
+}
+/// LedgerAccess opens a session on a right.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerAccess {
+    /// The right, in the journal's canonical encoding: a Semaphore proof that a
+    /// paid slot delegated the day to a P-256 key.
+    #[prost(bytes = "vec", tag = "1")]
+    pub right: ::prost::alloc::vec::Vec<u8>,
+    /// The challenge from LedgerChallenge on this stream; single use, short-lived.
+    #[prost(bytes = "vec", tag = "2")]
+    pub challenge: ::prost::alloc::vec::Vec<u8>,
+    /// 64 bytes r ‖ s: P-256 by the right's key over ledger.OpenDigest —
+    /// SHA-256("singula-open-v1" ‖ chainId ‖ domain ‖ challenge ‖ cp_star_id ‖
+    /// session_public_key). Binds the session to this CP and to the key the
+    /// credentials are sealed to.
+    #[prost(bytes = "vec", tag = "3")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Permission is one blind-signed entitlement, for one window.
 ///
@@ -299,7 +328,7 @@ pub struct Pong {
 pub struct ControlPlaneMessage {
     #[prost(
         oneof = "control_plane_message::Message",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub message: ::core::option::Option<control_plane_message::Message>,
 }
@@ -347,6 +376,12 @@ pub mod control_plane_message {
         AddSlotsResult(super::AddSlotsResult),
         #[prost(message, tag = "21")]
         GovernanceResult(super::GovernanceResult),
+        #[prost(message, tag = "22")]
+        LedgerChallenge(super::LedgerChallenge),
+        #[prost(message, tag = "23")]
+        LedgerAck(super::LedgerAck),
+        #[prost(message, tag = "24")]
+        LedgerSessionStatus(super::LedgerSessionStatus),
     }
 }
 /// SessionEndResult answers a signed SessionEnd.
@@ -1084,6 +1119,124 @@ pub struct TakePacketResult {
     #[prost(bool, tag = "8")]
     pub index_taken: bool,
 }
+/// LedgerChallengeRequest asks for a challenge to open a session with.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerChallengeRequest {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerChallenge {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// 32 random bytes, for one SessionRequest on this stream
+    #[prost(bytes = "vec", tag = "2")]
+    pub challenge: ::prost::alloc::vec::Vec<u8>,
+    /// Unix seconds
+    #[prost(int64, tag = "3")]
+    pub expires_at: i64,
+    /// what the open signature names
+    #[prost(uint64, tag = "4")]
+    pub cp_star_id: u64,
+}
+/// LedgerPing is a session's checkpoint: the client-signed ping and, beside it,
+/// the traffic the CP uses in real time (idle rules, closing a session that
+/// carries traffic without growing). Traffic is not signed and does not reach
+/// the journal.
+///
+/// `right` carries a new day's right into a running session: the first ping of
+/// a window goes with that window's right, and the tunnel stays up across
+/// midnight. The ping's signature by the right's key is what proves the client
+/// holds it, so no challenge is needed. Totals start from zero under the new
+/// right; the session keeps its id.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerPing {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// canonical encoding, without attestations
+    #[prost(bytes = "vec", tag = "2")]
+    pub ping: ::prost::alloc::vec::Vec<u8>,
+    /// since the session began
+    #[prost(uint64, tag = "3")]
+    pub bytes_up: u64,
+    #[prost(uint64, tag = "4")]
+    pub bytes_down: u64,
+    /// canonical encoding of the ping's right, when it is new to the session
+    #[prost(bytes = "vec", tag = "5")]
+    pub right: ::prost::alloc::vec::Vec<u8>,
+}
+/// LedgerAck answers a LedgerPing. `quorum` is whether a strict majority of one
+/// CP registry version attested the ping; their attestations are here for the
+/// client to check against that version's CPs, read from the chain. A client
+/// moves to another CP when pings stop reaching a quorum — and only a checked
+/// quorum resets that timer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LedgerAck {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub ping_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "3")]
+    pub attestations: ::prost::alloc::vec::Vec<LedgerAttestation>,
+    #[prost(bool, tag = "4")]
+    pub quorum: bool,
+    #[prost(string, tag = "5")]
+    pub error: ::prost::alloc::string::String,
+    /// registry_version names the CP registry version whose strict majority
+    /// the attestations are, when quorum is set: the client checks them against
+    /// that version's CPs, read from the chain itself.
+    #[prost(bytes = "vec", tag = "6")]
+    pub registry_version: ::prost::alloc::vec::Vec<u8>,
+}
+/// LedgerAttestation: CP `cp` first held the ping at `received_at`, as a CP of
+/// registry version `registry_version`. 65 bytes r ‖ s ‖ v by the CP's signer
+/// over keccak256("singula-attest-v2" ‖ chainId ‖ domain ‖ ping_hash ‖
+/// registry_version ‖ received_at).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerAttestation {
+    #[prost(uint64, tag = "1")]
+    pub cp: u64,
+    #[prost(int64, tag = "2")]
+    pub received_at: i64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub sig: ::prost::alloc::vec::Vec<u8>,
+    /// 32 bytes
+    #[prost(bytes = "vec", tag = "4")]
+    pub registry_version: ::prost::alloc::vec::Vec<u8>,
+}
+/// LedgerSessionStatusRequest: a client whose tunnel dropped asks why.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerSessionStatusRequest {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub session_uuid: ::prost::alloc::string::String,
+}
+/// LedgerSessionStatus: whether this Control Plane still holds the session
+/// open, and if it closed, why — so the client can reopen at once, move to
+/// another CP, or pick another node.
+///
+/// reason, when closed: "no_pings", "right_ended", "pings_not_growing",
+/// "idle", "overlap" (closed by a CP); "node_not_growing" (the node's
+/// watchdog), "shared_credentials" (the node saw its credentials used from
+/// several places), "expired" or "terminated" (closed by the node). Empty with
+/// state UNKNOWN when this CP never held it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LedgerSessionStatus {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub session_uuid: ::prost::alloc::string::String,
+    #[prost(enumeration = "LedgerSessionState", tag = "3")]
+    pub state: i32,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// The latest committed ping's total and time, when there is one.
+    #[prost(uint64, tag = "5")]
+    pub total: u64,
+    #[prost(int64, tag = "6")]
+    pub last: i64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SessionState {
@@ -1217,6 +1370,35 @@ impl EgressMode {
             "EGRESS_MODE_DIRECT" => Some(Self::Direct),
             "EGRESS_MODE_WARP" => Some(Self::Warp),
             "EGRESS_MODE_CUSTOM" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LedgerSessionState {
+    Unknown = 0,
+    Open = 1,
+    Closed = 2,
+}
+impl LedgerSessionState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "LEDGER_SESSION_STATE_UNKNOWN",
+            Self::Open => "LEDGER_SESSION_STATE_OPEN",
+            Self::Closed => "LEDGER_SESSION_STATE_CLOSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LEDGER_SESSION_STATE_UNKNOWN" => Some(Self::Unknown),
+            "LEDGER_SESSION_STATE_OPEN" => Some(Self::Open),
+            "LEDGER_SESSION_STATE_CLOSED" => Some(Self::Closed),
             _ => None,
         }
     }
