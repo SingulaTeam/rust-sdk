@@ -10,7 +10,7 @@
 //! Everything here is built from the calls in [`ControlPlaneClient`] and
 //! [`Chain`]; use those directly where this does not fit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use super::time::{SystemTime, TimeSource};
 use super::wallet::{PersonalMessage, Wallet, sign_message_checked};
 use super::{ClientError, ControlPlaneClient, Country, TunnelSettings, WalletAuth};
 use crate::chain::{Chain, Payment, Rpc, TokenId, TxHash};
-use crate::id::{StarId, UnixTime};
+use crate::id::{Epoch, StarId, UnixTime};
 use crate::zk::{Identity, Prover};
 
 /// How long a Control Plane has to answer when one is being chosen.
@@ -532,32 +532,53 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         let window = self
             .window_at(self.now(), Duration::ZERO)
             .ok_or(ClientError::Mismatch("the protocol has not started"))?;
-        for (slot, identity) in self.slot_order(&identities, window).await.iter() {
-            let day = match self.day_right(identity, *slot, window).await {
-                Ok(day) => day,
-                // Its Orbit ends during the day: another slot may not.
-                Err(ClientError::NotRegistered) => continue,
-                Err(e) => return Err(e),
-            };
-            let params = self.inner.chain.journal_params();
-            let request = SessionRequest::on_right(day.right.clone(), Arc::clone(&day.key), params);
-            let session = cp
-                .open(&self.inner.chain, options.shape(request))
+        let mut tried = HashSet::new();
+        loop {
+            let (slot, identity) = self.take_slot(&identities, window, &tried).await?;
+            tried.insert(slot);
+            match self
+                .open_on_slot(&cp, options, slot, &identity, window)
                 .await
-                .map_err(not_opened)?;
-            let tunnel = TunnelSettings::decode(session.credentials())?;
-            let opened = OnRight {
-                session,
-                tunnel,
-                admitting: cp,
-                identity: Arc::clone(identity),
-                slot: *slot,
-                window,
-                day,
-            };
-            return Ok(pinger::start(self.clone(), opened, meter, options.timing));
+            {
+                Ok(opened) => {
+                    return Ok(pinger::start(self.clone(), opened, meter, options.timing));
+                }
+                // Its Orbit ends during the day: another slot may not.
+                Err(ClientError::NotRegistered) => self.release_slot(slot).await,
+                Err(e) => {
+                    self.release_slot(slot).await;
+                    return Err(e);
+                }
+            }
         }
-        Err(ClientError::NotRegistered)
+    }
+
+    /// Opens a session at `cp` on slot `slot`'s right for `window`.
+    async fn open_on_slot(
+        &self,
+        cp: &ControlPlaneClient,
+        options: &ConnectOptions,
+        slot: u8,
+        identity: &Arc<Identity>,
+        window: Epoch,
+    ) -> Result<OnRight, ClientError> {
+        let day = self.day_right(identity, slot, window).await?;
+        let params = self.inner.chain.journal_params();
+        let request = SessionRequest::on_right(day.right.clone(), Arc::clone(&day.key), params);
+        let session = cp
+            .open(&self.inner.chain, options.shape(request))
+            .await
+            .map_err(not_opened)?;
+        let tunnel = TunnelSettings::decode(session.credentials())?;
+        Ok(OnRight {
+            session,
+            tunnel,
+            admitting: cp.clone(),
+            identity: Arc::clone(identity),
+            slot,
+            window,
+            day,
+        })
     }
 
     fn pinned(&self, star: StarId) -> Option<ControlPlaneClient> {

@@ -6,7 +6,7 @@
 //! itself from the chain — never takes from a Control Plane — and is kept
 //! for the day, so reconnecting costs no new proof.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,9 @@ pub(super) struct JournalState {
     rights: HashMap<(u8, Epoch), DayRight>,
     /// Slots another device was found on, and the day it was.
     busy: HashMap<u8, Epoch>,
+    /// Slots carrying one of this client's sessions, or about to: a slot
+    /// holds one session at a time.
+    held: HashSet<u8>,
 }
 
 /// A slot's right for one day, with its key.
@@ -127,19 +130,47 @@ impl<R: Rpc + 'static, S: Store + 'static> Singula<R, S> {
         self.inner.journal.lock().await.busy.insert(slot, window);
     }
 
-    /// The slots to try for a session on `window`, in order: those no other
-    /// device was found on today first, each group in random order, so
-    /// devices starting at once rarely pick the same.
-    pub(super) async fn slot_order(&self, identities: &Identities, window: Epoch) -> Identities {
-        let journal = self.inner.journal.lock().await;
-        let mut slots: Vec<_> = identities.iter().cloned().collect();
-        // Fisher–Yates, then a stable sort that keeps the shuffle within groups.
-        for i in (1..slots.len()).rev() {
-            let j = usize::try_from(OsRng.next_u64() % (i as u64 + 1)).unwrap_or(0);
-            slots.swap(i, j);
+    /// Takes a slot for a new session on `window`: one that carries none of
+    /// this client's sessions and is not in `tried`, preferring those no other
+    /// device was found on today, at random among equals so devices starting
+    /// at once rarely pick the same. The slot stays taken until
+    /// [`release_slot`](Self::release_slot).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::NoFreeSlot`] if every slot carries one of this
+    /// client's sessions, and [`ClientError::NotRegistered`] if every free
+    /// one has been tried.
+    pub(super) async fn take_slot(
+        &self,
+        identities: &Identities,
+        window: Epoch,
+        tried: &HashSet<u8>,
+    ) -> Result<(u8, Arc<Identity>), ClientError> {
+        let mut journal = self.inner.journal.lock().await;
+        let mut free: Vec<_> = identities
+            .iter()
+            .filter(|(slot, _)| !journal.held.contains(slot))
+            .cloned()
+            .collect();
+        if free.is_empty() {
+            return Err(ClientError::NoFreeSlot);
         }
-        slots.sort_by_key(|(slot, _)| journal.busy.get(slot) == Some(&window));
-        slots.into()
+        free.retain(|(slot, _)| !tried.contains(slot));
+        // Fisher–Yates, then a stable sort that keeps the shuffle within groups.
+        for i in (1..free.len()).rev() {
+            let j = usize::try_from(OsRng.next_u64() % (i as u64 + 1)).unwrap_or(0);
+            free.swap(i, j);
+        }
+        free.sort_by_key(|(slot, _)| journal.busy.get(slot) == Some(&window));
+        let (slot, identity) = free.into_iter().next().ok_or(ClientError::NotRegistered)?;
+        journal.held.insert(slot);
+        Ok((slot, identity))
+    }
+
+    /// Gives back a slot taken by [`take_slot`](Self::take_slot).
+    pub(super) async fn release_slot(&self, slot: u8) {
+        self.inner.journal.lock().await.held.remove(&slot);
     }
 
     /// The window a ping made at `now` belongs to: the window `now` falls

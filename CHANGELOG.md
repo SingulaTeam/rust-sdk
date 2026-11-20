@@ -8,6 +8,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `Singula::connect` keeps each of a client's sessions on a slot of its own:
+  a slot holds one session at a time, and a second one on it — another hop
+  of a route, say — would be closed as an overlap. With every slot taken it
+  returns the new `ClientError::NoFreeSlot` instead of opening a session to
+  be closed. A route of several hops needs as many slots.
+
 - `Singula::connect` and `ControlPlaneClient::open_session` return `Send`
   futures again, so a session can be opened from a spawned task. Opening on a
   right held a non-`Sync` reference across an await.

@@ -1120,3 +1120,43 @@ async fn connections_and_calls_can_be_spawned() {
     let auth = WalletAuth::sign(&wallet, CP).await.expect("signs");
     send(&cp.open_session(&chain, SessionRequest::wallet(auth)));
 }
+
+#[tokio::test]
+async fn each_of_a_clients_sessions_takes_its_own_slot() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula_with_slots(&wallet, 2).await;
+    let options = || {
+        super::ConnectOptions::new()
+            .control_plane(CP)
+            .timing(quick())
+    };
+
+    // Two hops of a route, say: two slots, two rights.
+    let first = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects");
+    let second = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects on the other slot");
+    assert_eq!(cp_state.state().journal.rights.len(), 2, "a right per slot");
+
+    // A third has no slot to go on, rather than opening one to be closed.
+    let third = singula.connect(&wallet, options(), Traffic::default).await;
+    assert!(matches!(third, Err(ClientError::NoFreeSlot)), "{third:?}");
+
+    // A slot given back is taken again.
+    first.close().await;
+    let again = singula
+        .connect(&wallet, options(), Traffic::default)
+        .await
+        .expect("connects on the slot given back");
+    assert_eq!(
+        cp_state.state().journal.rights.len(),
+        2,
+        "no new right: the day's is kept"
+    );
+    again.close().await;
+    second.close().await;
+}

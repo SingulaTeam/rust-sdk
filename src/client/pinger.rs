@@ -275,6 +275,7 @@ impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Pinger<R, S, M> {
         if reason == EndReason::ClosedByNetwork(CloseReason::Overlap) {
             self.singula.slot_busy(self.slot, self.window).await;
         }
+        self.singula.release_slot(self.slot).await;
         let _ = self.events.try_send(Event::Ended(reason));
     }
 
