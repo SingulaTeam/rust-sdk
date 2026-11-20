@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
 ### Added
 
 - The shared journal (`journal`, in the core): a subscriber's slot takes a
@@ -169,5 +171,6 @@ The first release: the whole client side of the protocol.
 - `Subscription::starts_at`: subscriptions stack, and one activated while
   another still runs starts where it ends.
 
-[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/SingulaTeam/rust-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SingulaTeam/rust-sdk/releases/tag/v0.1.0
