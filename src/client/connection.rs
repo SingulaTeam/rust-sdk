@@ -21,10 +21,15 @@ pub(super) const EVENT_BUFFER: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Timing {
-    /// Between pings of a session on a right. Pings are what the node is paid
-    /// for: the seconds after the last one are not counted. Control Planes
-    /// close a session no ping was recorded for in ten minutes.
+    /// Between pings of a session on a right, and before the first. Pings
+    /// are what the node is paid for: the seconds after the last one are not
+    /// counted. Control Planes close a session no ping was recorded for in ten
+    /// minutes.
     pub ping_every: Duration,
+    /// Before trying again after a ping that reached no majority: a passing
+    /// network error should not cost a whole interval, nor two of them the
+    /// session.
+    pub ping_retry: Duration,
     /// Between traffic reports of a wallet's session. Reports are what keeps
     /// the session's nonce fresh.
     pub report_every: Duration,
@@ -38,6 +43,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             ping_every: Duration::from_secs(5 * 60),
+            ping_retry: Duration::from_secs(30),
             report_every: Duration::from_secs(30),
             renew_ahead: Duration::from_secs(10 * 60),
             renew_retry: Duration::from_secs(60),

@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-20
+
+### Fixed
+
+- A session on a right sends its first ping one interval after opening, not
+  at once: an application brings its tunnel up right after a session opens,
+  and a ping in the middle of that could lose its connection. The seconds
+  before the first ping count all the same.
+- A ping that reaches no majority is tried again after `Timing::ping_retry`
+  (30 seconds) rather than a whole interval, so a passing network error no
+  longer leaves the session without a ping for ten minutes, when the
+  Control Planes close it.
+
 ## [0.2.1] - 2026-11-20
 
 ### Fixed
@@ -188,7 +201,8 @@ The first release: the whole client side of the protocol.
 - `Subscription::starts_at`: subscriptions stack, and one activated while
   another still runs starts where it ends.
 
-[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/SingulaTeam/rust-sdk/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/SingulaTeam/rust-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SingulaTeam/rust-sdk/releases/tag/v0.1.0

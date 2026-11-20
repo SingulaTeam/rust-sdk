@@ -539,6 +539,7 @@ async fn singula_with_slots(
 fn quick() -> super::Timing {
     super::Timing {
         ping_every: std::time::Duration::from_millis(100),
+        ping_retry: std::time::Duration::from_millis(100),
         report_every: std::time::Duration::from_millis(100),
         renew_ahead: std::time::Duration::from_secs(3_599),
         renew_retry: std::time::Duration::from_millis(100),
@@ -1206,4 +1207,44 @@ async fn a_slot_is_free_again_when_its_session_ends_or_its_opening_is_dropped() 
         .await
         .expect("reconnects at once on the slot given back");
     again.close().await;
+}
+
+#[tokio::test]
+async fn pings_wait_an_interval_first_and_retry_a_failure_sooner() {
+    let wallet = LocalWallet::random();
+    let (cp_state, singula) = singula(&wallet).await;
+    let timing = super::Timing {
+        ping_every: std::time::Duration::from_secs(3),
+        ping_retry: std::time::Duration::from_millis(100),
+        ..quick()
+    };
+    cp_state.state().journal.acks = testing::Acks::Short;
+    let options = super::ConnectOptions::new()
+        .control_plane(CP)
+        .timing(timing);
+    let mut conn = singula
+        .connect(&wallet, options, Traffic::default)
+        .await
+        .expect("connects");
+    // Not at once: the application's tunnel is still coming up.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        cp_state.state().journal.pings.is_empty(),
+        "a ping right at opening"
+    );
+
+    // A ping that reaches no majority is tried again well before the next
+    // interval: three failures inside six seconds, where intervals alone
+    // would take nine.
+    let three_failures = async {
+        while let Some(event) = conn.next_event().await {
+            if matches!(event, super::Event::PingFailed { in_a_row: 3, .. }) {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(6), three_failures)
+        .await
+        .expect("retried sooner than the interval");
+    conn.close().await;
 }

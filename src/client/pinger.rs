@@ -1,7 +1,9 @@
 //! A session on a right, kept alive by pings in the background.
 //!
 //! Every [`Timing::ping_every`] the session's seconds so far are signed with
-//! the day's right key and sent to a Control Plane. Its answer counts only
+//! the day's right key and sent to a Control Plane — the first one interval
+//! after opening, once the application's tunnel has long been up, since the
+//! seconds before it count all the same. Its answer counts only
 //! once its attestations check out against the chain: a strict majority of
 //! one registry version. When a Control Plane cannot show that, the same
 //! ping goes to the others, and the first that can carries the session from
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 
 use super::connect::Singula;
 use super::connection::{Connection, EVENT_BUFFER, EndReason, Event, Parts, Timing, TrafficMeter};
@@ -104,19 +106,19 @@ pub(super) fn start<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter>(
 
 impl<R: Rpc + 'static, S: Store + 'static, M: TrafficMeter> Pinger<R, S, M> {
     async fn run(mut self, mut stopped: oneshot::Receiver<()>, timing: Timing) {
-        // The first ping at once: it dates the session's start, and shows
-        // early whether the federation records it.
-        let mut pings = tokio::time::interval(timing.ping_every);
-        // A sleeping laptop wakes to one ping, not a burst of them.
-        pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Each round is timed from the end of the last, so a sleeping laptop
+        // wakes to one ping, not a burst of them.
+        let mut next = Instant::now() + timing.ping_every;
         let mut failed = 0;
         let reason = loop {
             tokio::select! {
                 _ = &mut stopped => break EndReason::Closed,
-                _ = pings.tick() => {
+                () = tokio::time::sleep_until(next) => {
                     if let Some(reason) = self.tick(&mut failed).await {
                         break reason;
                     }
+                    let wait = if failed == 0 { timing.ping_every } else { timing.ping_retry };
+                    next = Instant::now() + wait;
                 }
             }
         };

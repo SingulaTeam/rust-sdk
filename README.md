@@ -33,7 +33,7 @@ The crate is not on crates.io yet. Take it from this repository, pinned to a tag
 
 ```toml
 [dependencies]
-singula = { git = "https://github.com/SingulaTeam/rust-sdk", tag = "v0.2.1", features = ["client", "http"] }
+singula = { git = "https://github.com/SingulaTeam/rust-sdk", tag = "v0.2.2", features = ["client", "http"] }
 ```
 
 Build the API documentation locally with `cargo doc --open --all-features`.
