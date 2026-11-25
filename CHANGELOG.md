@@ -8,6 +8,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.3] - 2026-11-25
 
+### Security
+
+- `url` 2.5.8 → 2.5.9 (RUSTSEC-2026-0592), through `reqwest`.
+
 ### Added
 
 - `Cover::port`: the port each cover is reached on. A node without a reverse
