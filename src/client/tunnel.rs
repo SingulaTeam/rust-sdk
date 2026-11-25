@@ -8,11 +8,11 @@ use crate::session::Credentials;
 
 /// How to reach a session's node: VLESS over REALITY.
 ///
-/// A node serves every cover two ways on the same port, behind the same
+/// A node serves each cover two ways on the cover's port, behind the same
 /// REALITY: over raw TCP with [`flow`](Self::flow) (Vision), and over xHTTP at
 /// the cover's [`xhttp_path`](Cover::xhttp_path), with no flow. Either reaches
-/// the same session; which to use is the client's choice, and switching
-/// needs no new session.
+/// the same session, under any cover the node serves; which to use is the
+/// client's choice, and switching needs no new session.
 ///
 /// The SDK carries no tunnel; hand these to the engine of your choice. They
 /// let anyone holding them use the session, so treat them as secret.
@@ -23,7 +23,7 @@ pub struct TunnelSettings {
     pub uuid: String,
     /// The node's address, an IP or a host name.
     pub address: String,
-    /// The port of the REALITY inbound.
+    /// The port of the REALITY inbound for the chosen [`cover`](Self::cover).
     pub port: u16,
     /// The VLESS flow over raw TCP, such as `xtls-rprx-vision`; empty for
     /// none. Over xHTTP no flow is sent.
@@ -35,7 +35,8 @@ pub struct TunnelSettings {
     /// The cover the node chose for this session.
     pub cover: Cover,
     /// Every cover the node serves. The session works under any of them, so
-    /// a client whose cover is blocked can switch without a new session.
+    /// a client whose cover is blocked can switch without a new session —
+    /// to one whose [`port`](Cover::port) is known.
     pub covers: Vec<Cover>,
 }
 
@@ -50,6 +51,11 @@ pub struct Cover {
     /// The path to use over xHTTP, matched exactly by the node; `None` when
     /// the node serves this cover over raw TCP only.
     pub xhttp_path: Option<String>,
+    /// The port this cover is reached on: a node may serve each cover on a
+    /// port of its own, or all of them on one. `None` when the node does not
+    /// name it, as older nodes do not; switch only to covers whose port is
+    /// known. The chosen cover's is always known.
+    pub port: Option<u16>,
 }
 
 impl TunnelSettings {
@@ -96,20 +102,30 @@ impl TunnelSettings {
             flow: v.flow,
             reality_public_key: v.reality_public_key,
             fingerprint: v.fingerprint,
+            covers: v
+                .covers
+                .into_iter()
+                .map(|c| {
+                    // The chosen cover is reached on the session's port,
+                    // whether or not the node names it again.
+                    let port = u16::try_from(c.port)
+                        .ok()
+                        .filter(|&p| p != 0)
+                        .or((c.preset_id == v.preset_id).then_some(port));
+                    Cover {
+                        preset: c.preset_id,
+                        names: names(c.sni_pool),
+                        xhttp_path: path(c.xhttp_path),
+                        port,
+                    }
+                })
+                .collect(),
             cover: Cover {
                 preset: v.preset_id,
                 names: chosen,
                 xhttp_path: path(v.transport_path),
+                port: Some(port),
             },
-            covers: v
-                .covers
-                .into_iter()
-                .map(|c| Cover {
-                    preset: c.preset_id,
-                    names: names(c.sni_pool),
-                    xhttp_path: path(c.xhttp_path),
-                })
-                .collect(),
         })
     }
 }
@@ -156,11 +172,13 @@ mod tests {
                     preset_id: "default".into(),
                     sni_pool: vec![],
                     xhttp_path: "/api/health/check".into(),
+                    port: 443,
                 },
                 CoverOption {
                     preset_id: "CN".into(),
                     sni_pool: vec![],
                     xhttp_path: String::new(),
+                    port: 2053,
                 },
             ],
             ..Default::default()
@@ -174,6 +192,37 @@ mod tests {
         assert_eq!(
             s.covers[1].xhttp_path, None,
             "a cover served over raw TCP only"
+        );
+        assert_eq!(s.cover.port, Some(8443));
+        assert_eq!(
+            s.covers.iter().map(|c| c.port).collect::<Vec<_>>(),
+            [Some(443), Some(2053)],
+            "each cover on its own port"
+        );
+    }
+
+    #[test]
+    fn knows_only_the_chosen_covers_port_from_a_node_that_names_none() {
+        let cover = |preset: &str| CoverOption {
+            preset_id: preset.into(),
+            sni_pool: vec![],
+            xhttp_path: String::new(),
+            port: 0,
+        };
+        let v = VlessCredentials {
+            address: "203.0.113.7".into(),
+            endpoint_port: 8443,
+            preset_id: "RU".into(),
+            server_name: "a.example".into(),
+            covers: vec![cover("default"), cover("RU")],
+            ..Default::default()
+        };
+        let s = TunnelSettings::decode(&sealed(&v)).expect("decodes");
+        assert_eq!(s.cover.port, Some(8443));
+        assert_eq!(
+            s.covers.iter().map(|c| c.port).collect::<Vec<_>>(),
+            [None, Some(8443)],
+            "the chosen cover is reached on the session's port"
         );
     }
 

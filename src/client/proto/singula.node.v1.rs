@@ -67,4 +67,7 @@ pub struct CoverOption {
     /// this cover's xHTTP path; see transport_path
     #[prost(string, tag = "3")]
     pub xhttp_path: ::prost::alloc::string::String,
+    /// the public port this cover is reached on; 0 from older nodes
+    #[prost(uint32, tag = "4")]
+    pub port: u32,
 }
